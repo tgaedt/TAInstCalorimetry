@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Measurement.get_data_with_metadata()`.** Returns the measurement data
+  joined with its added metadata as one tidy DataFrame, ready to export with
+  `.to_csv(...)`. Works on per-sample data (joining on the metadata id column)
+  and after `average_by_metadata` (joining on the group label and attaching
+  only metadata that is constant within each group). Returns the data unchanged
+  when no metadata has been added.
+
 ## [0.3.3] - 2026-05-06
 
 ### Breaking Changes
