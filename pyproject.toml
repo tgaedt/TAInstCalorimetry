@@ -84,7 +84,7 @@ addopts = "-q --nbmake"
 [tool.tox]
 legacy_tox_ini = """
 [tox]
-envlist =  py310, py311, py312, py313, mypy
+envlist =  py310, py311, py312, py313, py314, mypy
 
 [gh-actions]
 python =
@@ -92,6 +92,7 @@ python =
     3.11: py311
     3.12: py312
     3.13: py313
+    3.14: py314
 
 [testenv]
 commands = pytest
