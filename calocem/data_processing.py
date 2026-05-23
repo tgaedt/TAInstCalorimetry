@@ -575,3 +575,75 @@ class MetadataAggregator:
 
         except Exception as e:
             raise DataProcessingException("average_by_metadata", e)
+
+    @staticmethod
+    def combine_with_metadata(
+        data: pd.DataFrame,
+        metadata: pd.DataFrame,
+        meta_id_col: str,
+        group_cols: Optional[list[str]] = None,
+    ) -> pd.DataFrame:
+        """Join measurement data with its metadata into one tidy frame.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Measurement data keyed by ``sample_short``.
+        metadata : pd.DataFrame
+            Metadata table.
+        meta_id_col : str
+            Metadata column matching the per-sample ``sample_short``.
+        group_cols : list of str, optional
+            The column(s) passed to :meth:`average_by_metadata`. When set,
+            ``data`` is averaged and ``sample_short`` holds the group label, so
+            the join is performed on that label and only metadata constant
+            within each group is kept (within-group-varying columns have no
+            single value per averaged curve).
+
+        Returns
+        -------
+        pd.DataFrame
+            ``data`` with the matching metadata columns appended; an unchanged
+            copy when *metadata* is empty.
+        """
+        if metadata.empty:
+            return data.copy()
+
+        if not group_cols:
+            # Per-sample data: join on the original sample id column.
+            merged = data.merge(
+                metadata,
+                left_on="sample_short",
+                right_on=meta_id_col,
+                how="left",
+                suffixes=("", "_meta"),
+            )
+            if meta_id_col != "sample_short" and meta_id_col in merged.columns:
+                # redundant duplicate of sample_short
+                merged = merged.drop(columns=[meta_id_col])
+            return merged
+
+        # Averaged data: rebuild the group label exactly as average_by_metadata
+        # does, then attach the metadata that is constant within each group.
+        label = metadata[group_cols].astype(str).apply(
+            lambda row: " | ".join(row), axis=1
+        )
+        meta = metadata.assign(_group_label=label)
+
+        constant_cols = [
+            c
+            for c in metadata.columns
+            if meta.groupby("_group_label")[c].nunique(dropna=False).le(1).all()
+        ]
+        group_meta = meta[["_group_label", *constant_cols]].drop_duplicates(
+            "_group_label"
+        )
+
+        merged = data.merge(
+            group_meta,
+            left_on="sample_short",
+            right_on="_group_label",
+            how="left",
+            suffixes=("", "_meta"),
+        )
+        return merged.drop(columns=["_group_label"])
