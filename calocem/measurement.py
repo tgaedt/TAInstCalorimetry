@@ -28,6 +28,7 @@ from .exceptions import AutoCleanException, ColdStartException, DataProcessingEx
 from .file_io import DataPersistence, FolderDataLoader
 from .plotting import SimplePlotter
 from .processparams import ProcessingParameters
+from .utils import adaptive_downsample, downsample_sections
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +183,31 @@ class Measurement:
             raise AutoCleanException() from e
 
     def _apply_adaptive_downsampling(self):
-        """Apply adaptive downsampling if configured."""
-        # TODO: Implement downsampling logic
-        logger.info("Downsampling requested but not yet implemented")
+        """Apply adaptive downsampling to the heat flow data, per sample."""
+        downsampled = []
+        for _, sample_data in SampleIterator.iter_samples(self._data):
+            sample_data = sample_data.dropna(subset=["normalized_heat_flow_w_g"])
+            if sample_data.empty:
+                continue
+
+            if self.processparams.downsample.section_split:
+                sample_data = downsample_sections(
+                    sample_data,
+                    x_col="time_s",
+                    y_col="normalized_heat_flow_w_g",
+                    processparams=self.processparams,
+                )
+            else:
+                sample_data = adaptive_downsample(
+                    sample_data,
+                    x_col="time_s",
+                    y_col="normalized_heat_flow_w_g",
+                    processparams=self.processparams,
+                )
+            downsampled.append(sample_data)
+
+        if downsampled:
+            self._data = pd.concat(downsampled)
 
     # Data access methods
     def get_data(self) -> pd.DataFrame:
