@@ -625,8 +625,8 @@ class MetadataAggregator:
 
         # Averaged data: rebuild the group label exactly as average_by_metadata
         # does, then attach the metadata that is constant within each group.
-        label = metadata[group_cols].astype(str).apply(
-            lambda row: " | ".join(row), axis=1
+        label = metadata[group_cols].apply(
+            lambda row: " | ".join(str(v) for v in row), axis=1
         )
         meta = metadata.assign(_group_label=label)
 
