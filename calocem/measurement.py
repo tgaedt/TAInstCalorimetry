@@ -96,6 +96,7 @@ class Measurement:
         self._data_unprocessed = pd.DataFrame()
         self._metadata = pd.DataFrame()
         self._metadata_id = ""
+        self._average_groupby: Optional[list[str]] = None
 
         # Store configuration
         self._new_code = new_code
@@ -203,6 +204,24 @@ class Measurement:
     def get_metadata(self) -> tuple:
         """Get added metadata and the ID column name."""
         return self._metadata, self._metadata_id
+
+    def get_data_with_metadata(self) -> pd.DataFrame:
+        """Return the data joined with its metadata as one tidy DataFrame.
+
+        Works on per-sample data and after :meth:`average_by_metadata` alike.
+        For averaged data, only metadata that is constant within each group is
+        attached. The data is returned unchanged when no metadata has been
+        added via :meth:`add_metadata_source`.
+
+        Export with, e.g.,
+        ``m.get_data_with_metadata().to_csv(path, index=False)``.
+        """
+        return MetadataAggregator.combine_with_metadata(
+            self._data,
+            self._metadata,
+            self._metadata_id,
+            self._average_groupby,
+        )
 
     def get_sample_names(self) -> list:
         """Get list of sample names."""
@@ -1939,6 +1958,7 @@ class Measurement:
             groupby,
             bin_width_s,
         )
+        self._average_groupby = [groupby] if isinstance(groupby, str) else list(groupby)
 
     def undo_average_by_metadata(self) -> None:
         """Restore the original per-sample data after average_by_metadata."""
@@ -1948,6 +1968,7 @@ class Measurement:
             )
         self._data = self._data_before_average
         del self._data_before_average
+        self._average_groupby = None
 
     def remove_pickle_files(self):
         """Remove pickle cache files."""
