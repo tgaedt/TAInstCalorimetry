@@ -1,6 +1,7 @@
 import csv
 import re
 import pathlib
+import warnings
 from pathlib import Path
 
 import matplotlib
@@ -523,9 +524,19 @@ def adaptive_downsample(df, x_col, y_col, processparams):
     x = df[x_col].values
     y = df[y_col].values
 
-    # print(y)
-    # interpolate the data
-    spl = UnivariateSpline(x, y, s=processparams.downsample.smoothing_factor)
+    # UnivariateSpline's smoothing target `s` is an absolute residual sum,
+    # so it is scale-dependent. Express it relative to the data
+    # (points * variance) so a given smoothing_factor behaves the same
+    # regardless of the heat-flow magnitude. The curvature-based sampling
+    # below is invariant to a constant scaling of y, so this only fixes
+    # convergence without distorting point selection.
+    s = processparams.downsample.smoothing_factor * len(y) * np.var(y)
+    with warnings.catch_warnings():
+        # Safety net: for pathological data FITPACK may still fail to reach
+        # the target and emit a UserWarning; the returned approximation is
+        # adequate for curvature estimation. Scoped to this call only.
+        warnings.simplefilter("ignore", category=UserWarning)
+        spl = UnivariateSpline(x, y, s=s)
     new_x = x  # np.linspace(x.min(), x.max(), len(x))
     # print(new_x)
     new_y = spl(new_x)
