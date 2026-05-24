@@ -72,3 +72,25 @@ def test_undo_average_restores_per_sample_join():
     assert "calorimetry_data_1" in set(combined["sample_short"].unique())
     assert "cement_name" in combined.columns
     assert "experiment_nr" not in combined.columns
+
+
+def test_averaged_join_handles_nan_in_group_column(tmp_path):
+    # Regression: under pandas 3.0, astype(str) leaves NaN as a float, which
+    # broke the " | ".join group-label reconstruction when a group column had
+    # missing values. The label must be built by stringifying each value.
+    meta = tmp_path / "meta_with_nan.csv"
+    meta.write_text(
+        "experiment_nr,polymer,dosage\n"
+        "calorimetry_data_1,A,1\n"
+        "calorimetry_data_2,,2\n"  # missing polymer -> NaN in a group column
+        "calorimetry_data_3,A,1\n"
+    )
+    m = Measurement(DATA_DIR, regex=r"calorimetry_data_[123]\.csv", show_info=False)
+    m.add_metadata_source(meta, "experiment_nr", show_info=False)
+    m.average_by_metadata(["polymer", "dosage"])
+
+    combined = m.get_data_with_metadata()  # must not raise
+
+    assert "polymer" in combined.columns
+    assert "A | 1" in set(combined["sample_short"].unique())
+    assert (combined.loc[combined["sample_short"] == "A | 1", "polymer"] == "A").all()
