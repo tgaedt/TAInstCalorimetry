@@ -154,7 +154,11 @@ class DownSamplingParameters:
     num_points: int
         The target number of points after downsampling. Default is 1000.
     smoothing_factor: float
-        Smoothing factor used in the downsampling algorithm. Default is 1e-10.
+        Relative smoothing factor for the spline used in the downsampling
+        algorithm. It is scaled internally by the number of points and the
+        variance of the heat flow, so the same value behaves consistently
+        regardless of the heat flow magnitude. Smaller values follow the
+        data more closely. Default is 1e-6.
     baseline_weight: float
         Weight of the baseline in the downsampling algorithm. Default is 0.1.
     section_split: bool
@@ -164,7 +168,7 @@ class DownSamplingParameters:
     """
     apply: bool = False
     num_points: int = 1000
-    smoothing_factor: float = 1e-10
+    smoothing_factor: float = 1e-6
     baseline_weight: float = 0.1
     section_split: bool = False
     section_split_time_s: int = 1000
