@@ -7,6 +7,7 @@ import pathlib
 import pickle
 import re
 from abc import ABC, abstractmethod
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Tuple, Union
 
 import pandas as pd
@@ -14,7 +15,7 @@ from scipy import integrate
 
 from calocem import utils
 
-from .exceptions import FileReadingException
+from .exceptions import DataProcessingException, FileReadingException
 
 logger = logging.getLogger(__name__)
 
@@ -655,6 +656,66 @@ class DataPersistence:
         except Exception as e:
             logger.error(f"Failed to remove pickle files: {e}")
             raise
+
+
+def _calocem_version() -> str:
+    """Return the installed calocem version, or "unknown" if undetermined."""
+    try:
+        return version("calocem")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def save_measurement(measurement, path: Union[str, pathlib.Path]) -> None:
+    """Pickle a whole Measurement to a named file, with a version stamp.
+
+    The entire object is stored, so processed (e.g. downsampled) data, info,
+    added metadata and ``processparams`` are all preserved. This is a
+    convenience cache, not an archive: the raw source files remain the source
+    of truth, so a file that fails to load can be regenerated from the folder.
+    """
+    path = pathlib.Path(path)
+    bundle = {
+        "calocem_version": _calocem_version(),
+        "format_version": 1,
+        "measurement": measurement,
+    }
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+    logger.info("Measurement saved to %s", path)
+
+
+def load_measurement(path: Union[str, pathlib.Path]):
+    """Load a Measurement previously written with :func:`save_measurement`.
+
+    Raises
+    ------
+    DataProcessingException
+        If the file cannot be unpickled, e.g. because it was written by an
+        incompatible calocem version. Regenerate it from the raw folder.
+    """
+    path = pathlib.Path(path)
+    try:
+        with open(path, "rb") as f:
+            bundle = pickle.load(f)
+    except Exception as e:
+        raise DataProcessingException(
+            "load",
+            f"Could not load Measurement from {path}. It may have been "
+            f"written by an incompatible calocem version; regenerate it "
+            f"from the raw folder. Original error: {e}",
+        ) from e
+
+    saved_version = bundle.get("calocem_version", "unknown")
+    current_version = _calocem_version()
+    if saved_version != current_version:
+        logger.warning(
+            "Measurement was saved with calocem %s but %s is running; "
+            "re-run from the raw folder if results look off.",
+            saved_version,
+            current_version,
+        )
+    return bundle["measurement"]
 
 
 class FolderDataLoader:
