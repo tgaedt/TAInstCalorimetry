@@ -130,6 +130,146 @@ class DeconvolutionAnalyzer:
         x_logn = np.clip(x, 1e-12, None)
         return self._lognormal_peak(x_logn, amplitude, center, width)
 
+    @staticmethod
+    def _odd_savgol_window(n_points: int, requested: int, polyorder: int):
+        """Return a valid odd Savitzky-Golay window <= n_points, or None."""
+        window = min(int(requested), n_points)
+        if window % 2 == 0:
+            window -= 1
+        if window <= polyorder:
+            return None
+        return window
+
+    def detect_peaks_and_shoulders(
+        self,
+        data: pd.DataFrame,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Detect peaks (maxima) and shoulders (curvature valleys) per sample.
+
+        The signal is resampled onto a uniform time grid and smoothed with a
+        Savitzky-Golay filter. Local maxima are found with
+        :func:`scipy.signal.find_peaks` using the configured peak-detection
+        prominence and distance. Shoulders are found as valleys of the second
+        derivative (maxima of the negative curvature) that do not coincide
+        with a detected maximum, i.e. inflection features on a flank that are
+        not themselves local maxima.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per detected feature with ``sample``, ``sample_short``,
+            ``feature_type`` ('peak' or 'shoulder'), ``center_time_s`` and
+            ``heat_flow``.
+        """
+        try:
+            from scipy import signal
+
+            params = self.processparams.deconvolution
+            cutoff_min = self.processparams.cutoff.cutoff_min or 0
+            polyorder = int(params.savgol_polyorder)
+            distance = self.processparams.peakdetection.distance
+            prominence = self.processparams.peakdetection.prominence
+
+            rows = []
+
+            for sample, sample_data in SampleIterator.iter_samples(data, regex):
+                sample_short = pathlib.Path(str(sample)).stem
+
+                working = (
+                    sample_data[[age_col, target_col]]
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                    .sort_values(age_col)
+                )
+                if cutoff_min > 0:
+                    working = working[working[age_col] >= cutoff_min * 60]
+
+                if len(working) < params.min_points:
+                    logger.warning(
+                        f"Not enough points to detect features in {sample_short}"
+                    )
+                    continue
+
+                x = working[age_col].to_numpy(dtype=float)
+                y = working[target_col].to_numpy(dtype=float)
+
+                # Resample onto a uniform grid so the derivative is well defined.
+                x_uniform = np.linspace(x.min(), x.max(), len(x))
+                y_uniform = np.interp(x_uniform, x, y)
+                delta = float(x_uniform[1] - x_uniform[0])
+
+                window = self._odd_savgol_window(
+                    len(y_uniform), params.savgol_window, polyorder
+                )
+                if window is None:
+                    y_smooth = y_uniform
+                    curvature = np.gradient(np.gradient(y_uniform, delta), delta)
+                else:
+                    y_smooth = signal.savgol_filter(y_uniform, window, polyorder)
+                    curvature = signal.savgol_filter(
+                        y_uniform, window, polyorder, deriv=2, delta=delta
+                    )
+
+                # Local maxima
+                peak_idx, _ = signal.find_peaks(
+                    y_smooth, prominence=prominence, distance=distance
+                )
+
+                # Shoulders: valleys of the second derivative (negative curvature
+                # maxima) that are not already captured as maxima.
+                neg_curvature = -curvature
+                max_neg = float(np.nanmax(neg_curvature)) if len(neg_curvature) else 0.0
+                shoulder_idx = np.array([], dtype=int)
+                if max_neg > 0:
+                    curv_idx, _ = signal.find_peaks(
+                        neg_curvature,
+                        prominence=params.shoulder_curvature_fraction * max_neg,
+                        distance=distance,
+                    )
+                    if len(curv_idx) > 0 and len(peak_idx) > 0:
+                        keep = [
+                            i
+                            for i in curv_idx
+                            if np.min(np.abs(peak_idx - i)) > distance
+                        ]
+                        shoulder_idx = np.array(keep, dtype=int)
+                    else:
+                        shoulder_idx = curv_idx
+
+                for i in peak_idx:
+                    rows.append(
+                        {
+                            "sample": sample,
+                            "sample_short": sample_short,
+                            "feature_type": "peak",
+                            "center_time_s": float(x_uniform[i]),
+                            "heat_flow": float(y_smooth[i]),
+                        }
+                    )
+                for i in shoulder_idx:
+                    rows.append(
+                        {
+                            "sample": sample,
+                            "sample_short": sample_short,
+                            "feature_type": "shoulder",
+                            "center_time_s": float(x_uniform[i]),
+                            "heat_flow": float(y_smooth[i]),
+                        }
+                    )
+
+            result = pd.DataFrame(rows)
+            if not result.empty:
+                result = result.sort_values(
+                    ["sample_short", "center_time_s"]
+                ).reset_index(drop=True)
+            return result
+
+        except Exception as e:
+            raise DataProcessingException("detect_peaks_and_shoulders", e)
+
     def get_deconvolution(
         self,
         data: pd.DataFrame,
@@ -141,14 +281,25 @@ class DeconvolutionAnalyzer:
         baseline_mode: Optional[str] = None,
         relative_intensity_upper_bounds: Optional[list[float]] = None,
         peak_width_upper_bounds: Optional[list[float]] = None,
+        seed_centers: Optional[list[float]] = None,
     ) -> pd.DataFrame:
-        """Fit peak deconvolution and return one result row per fitted component."""
+        """Fit peak deconvolution and return one result row per fitted component.
+
+        When ``seed_centers`` is provided (a list of component centre times in
+        ``age_col`` units), those positions seed the fit and their count sets
+        the number of components, overriding ``n_peaks`` and the internal
+        maximum-based seeding. This is used to seed the fit from detected
+        peaks and shoulders (see :meth:`detect_peaks_and_shoulders`).
+        """
         try:
             from scipy.optimize import minimize
             from scipy.signal import find_peaks
 
             params = self.processparams.deconvolution
-            n_components = int(n_peaks if n_peaks is not None else params.n_peaks)
+            if seed_centers is not None:
+                n_components = len(seed_centers)
+            else:
+                n_components = int(n_peaks if n_peaks is not None else params.n_peaks)
             if n_components < 1:
                 raise ValueError("n_peaks must be >= 1")
 
@@ -248,20 +399,28 @@ class DeconvolutionAnalyzer:
                     x_fit_opt = x_fit[fit_idx]
                     y_fit_opt = y[fit_idx]
 
-                peak_distance = max(
-                    1,
-                    int(len(y) * max(params.min_peak_distance_fraction, 0.0)),
-                )
-                candidate_peaks, _ = find_peaks(y, distance=peak_distance)
-
-                if len(candidate_peaks) > 0:
-                    sorted_peak_idx = candidate_peaks[
-                        np.argsort(y[candidate_peaks])[::-1]
+                if seed_centers is not None:
+                    # Seeds are given in original age_col units; shift them into
+                    # the fit coordinates and keep them within the data range.
+                    init_centers = [
+                        float(min(max(c + x_shift, x_min), x_max))
+                        for c in sorted(seed_centers)
                     ]
-                    selected_idx = np.sort(sorted_peak_idx[:n_components])
-                    init_centers = x_fit[selected_idx].tolist()
                 else:
-                    init_centers = []
+                    peak_distance = max(
+                        1,
+                        int(len(y) * max(params.min_peak_distance_fraction, 0.0)),
+                    )
+                    candidate_peaks, _ = find_peaks(y, distance=peak_distance)
+
+                    if len(candidate_peaks) > 0:
+                        sorted_peak_idx = candidate_peaks[
+                            np.argsort(y[candidate_peaks])[::-1]
+                        ]
+                        selected_idx = np.sort(sorted_peak_idx[:n_components])
+                        init_centers = x_fit[selected_idx].tolist()
+                    else:
+                        init_centers = []
 
                 while len(init_centers) < n_components:
                     quantile = (len(init_centers) + 1) / (n_components + 1)
@@ -1332,203 +1491,362 @@ class FlankTangentAnalyzer:
                 else:
                     baseline_value = baseline_data[target_col].min()
 
-                # Define flank region
-                flank_height_range = peak_value - baseline_value
-                flank_start_value = (
-                    baseline_value + flank_fraction_start * flank_height_range
-                )
-                flank_end_value = (
-                    baseline_value + flank_fraction_end * flank_height_range
-                )
-
-                # Calculate gradient to ensure we only consider regions with positive slope
-                sample_data = sample_data.assign(
-                    gradient=np.gradient(sample_data[target_col], sample_data[age_col])
-                )
-
-                # Extract ascending flank data - only include points with positive gradient
-                flank_data = sample_data[
-                    (sample_data[target_col] >= flank_start_value)
-                    & (sample_data[target_col] <= flank_end_value)
-                    & (sample_data[age_col] <= peak_time)
-                    & (sample_data["gradient"] > 0)  # Only positive gradients
-                ].copy()
-
-                # If no positive gradient data in initial range, try to find the lowest point with positive gradient
-                if len(flank_data) < 3:
-                    # Find data points with positive gradient before peak
-                    positive_gradient_data = sample_data[
-                        (sample_data[age_col] <= peak_time)
-                        & (sample_data["gradient"] > 0)
-                    ]
-
-                    if len(positive_gradient_data) >= 3:
-                        # Adjust flank start to the minimum value with positive gradient
-                        min_positive_value = positive_gradient_data[target_col].min()
-                        adjusted_flank_start = max(
-                            flank_start_value, min_positive_value
-                        )
-
-                        flank_data = sample_data[
-                            (sample_data[target_col] >= adjusted_flank_start)
-                            & (sample_data[target_col] <= flank_end_value)
-                            & (sample_data[age_col] <= peak_time)
-                            & (sample_data["gradient"] > 0)
-                        ].copy()
-
-                        # Update the flank_start_value for recording
-                        flank_start_value = adjusted_flank_start
-
-                if len(flank_data) < 3:
-                    logger.warning(
-                        f"Insufficient flank data in {pathlib.Path(str(sample)).stem}"
-                    )
-                    continue
-
-                # Calculate moving tangents over windows
-                flank_time_range = flank_data[age_col].max() - flank_data[age_col].min()
-                window_time = window_size * flank_time_range
-
-                tangent_slopes = []
-                tangent_times = []
-                tangent_values = []
-
-                # Slide window across flank
-                start_time = flank_data[age_col].min()
-                end_time = flank_data[age_col].max() - window_time
-
-                step_size = window_time * 1.1  # 10% overlap
-                current_time = start_time
-
-                while current_time <= end_time:
-                    window_end = current_time + window_time
-                    window_data = flank_data[
-                        (flank_data[age_col] >= current_time)
-                        & (flank_data[age_col] <= window_end)
-                    ]
-
-                    if len(window_data) >= 3:
-                        # Linear regression for this window
-                        x = window_data[age_col].values
-                        y = window_data[target_col].values
-
-                        # Use numpy polyfit for linear regression
-                        slope, intercept = np.polyfit(x, y, 1)
-
-                        # Only consider positive gradients (ascending flank)
-                        if slope > 0:
-                            tangent_slopes.append(slope)
-                            tangent_times.append(np.mean(x))
-                            tangent_values.append(np.mean(y))
-
-                    current_time += step_size
-
-                if not tangent_slopes:
-                    logger.warning(
-                        f"No valid tangent windows with positive gradients found in {pathlib.Path(str(sample)).stem}"
-                    )
-                    continue
-
-                # Calculate representative tangent (median to avoid outliers)
-                representative_slope = np.median(tangent_slopes)
-                representative_time = np.median(tangent_times)
-                representative_value = np.median(tangent_values)
-
-                # Calculate tangent line parameters
-                # y = mx + b, so b = y - mx
-                tangent_intercept = (
-                    representative_value - representative_slope * representative_time
-                )
-                # calculate x intersection
-                # y=0, so x = -b/m
-                x_intersection = (
-                    -tangent_intercept / representative_slope
-                    if representative_slope != 0
-                    else np.nan
-                )
-
-                # Calculate intersection with horizontal line at minimum before tangent_time_s
-                data_before_tangent = sample_data[
-                    sample_data[age_col] <= representative_time
-                ]
-                if len(data_before_tangent) > 0:
-                    min_value_before_tangent = data_before_tangent[target_col].min()
-                    # Intersection: y = min_value = slope * x + intercept
-                    # x = (y - intercept) / slope
-                    x_intersection_min = (
-                        (min_value_before_tangent - tangent_intercept)
-                        / representative_slope
-                        if representative_slope != 0
-                        else np.nan
-                    )
-                else:
-                    min_value_before_tangent = np.nan
-                    x_intersection_min = np.nan
-
-                # get normalized_heat_j_g at representative_time
-                tangent_j_g = np.interp(
-                    representative_time,
-                    sample_data[age_col],
-                    sample_data["normalized_heat_j_g"],
-                )
-
-                # get normalized_heat_j_g at peak_time
-                peak_j_g = np.interp(
+                core = self._flank_tangent_for_peak(
+                    sample_data,
                     peak_time,
-                    sample_data[age_col],
-                    sample_data["normalized_heat_j_g"],
+                    peak_value,
+                    baseline_value,
+                    target_col,
+                    age_col,
                 )
-
-                # get normalized_heat_j_g at x_intersection
-                x_intersection_j_g = (
-                    np.interp(
-                        x_intersection,
-                        sample_data[age_col],
-                        sample_data["normalized_heat_j_g"],
+                if core is None:
+                    logger.warning(
+                        f"Insufficient flank/tangent data in {pathlib.Path(str(sample)).stem}"
                     )
-                    if not np.isnan(x_intersection)
-                    else np.nan
-                )
-
-                # get normalized_heat_j_g at x_intersection_min
-                x_intersection_dormant_j_g = (
-                    np.interp(
-                        x_intersection_min,
-                        sample_data[age_col],
-                        sample_data["normalized_heat_j_g"],
-                    )
-                    if not np.isnan(x_intersection_min)
-                    else np.nan
-                )
+                    continue
 
                 result = {
                     "sample": sample,
                     "sample_short": pathlib.Path(str(sample)).stem,
-                    "peak_time_s": peak_time,
-                    "peak_value": peak_value,
-                    "peak_j_g": peak_j_g,
-                    "tangent_slope": representative_slope,
-                    "tangent_time_s": representative_time,
-                    "tangent_value": representative_value,
-                    "tangent_intercept": tangent_intercept,
-                    "tangent_j_g": tangent_j_g,
-                    "flank_start_value": flank_start_value,
-                    "flank_end_value": flank_end_value,
-                    "n_windows": len(tangent_slopes),
-                    "slope_std": np.std(tangent_slopes),
-                    "x_intersection": x_intersection,
-                    "min_value_before_tangent": min_value_before_tangent,
-                    "x_intersection_dormant": x_intersection_min,
-                    "x_intersection_dormant_j_g": x_intersection_dormant_j_g,
-                    "x_intersection_j_g": x_intersection_j_g,
+                    **core,
                 }
-
                 results.append(result)
 
             return pd.DataFrame(results)
 
         except Exception as e:
             raise DataProcessingException("get_ascending_flank_tangent", e)
+
+    def _flank_tangent_for_peak(
+        self,
+        sample_data: pd.DataFrame,
+        peak_time: float,
+        peak_value: float,
+        baseline_value: float,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+    ) -> Optional[dict]:
+        """Compute the ascending-flank tangent for a single peak.
+
+        Extracted from :meth:`get_ascending_flank_tangent` so the same
+        windowed-median slope logic can be reused per peak (e.g. by
+        :meth:`get_multipeak_params`). Returns a dictionary of tangent
+        characteristics, or ``None`` when there is insufficient flank data
+        or no valid tangent window with a positive gradient.
+        """
+        flank_fraction_start = self.processparams.slope_analysis.flank_fraction_start
+        flank_fraction_end = self.processparams.slope_analysis.flank_fraction_end
+        window_size = self.processparams.slope_analysis.window_size
+
+        # Define flank region
+        flank_height_range = peak_value - baseline_value
+        flank_start_value = baseline_value + flank_fraction_start * flank_height_range
+        flank_end_value = baseline_value + flank_fraction_end * flank_height_range
+
+        # Calculate gradient to ensure we only consider regions with positive slope
+        sample_data = sample_data.assign(
+            gradient=np.gradient(sample_data[target_col], sample_data[age_col])
+        )
+
+        # Extract ascending flank data - only include points with positive gradient
+        flank_data = sample_data[
+            (sample_data[target_col] >= flank_start_value)
+            & (sample_data[target_col] <= flank_end_value)
+            & (sample_data[age_col] <= peak_time)
+            & (sample_data["gradient"] > 0)  # Only positive gradients
+        ].copy()
+
+        # If no positive gradient data in initial range, try to find the lowest point with positive gradient
+        if len(flank_data) < 3:
+            # Find data points with positive gradient before peak
+            positive_gradient_data = sample_data[
+                (sample_data[age_col] <= peak_time) & (sample_data["gradient"] > 0)
+            ]
+
+            if len(positive_gradient_data) >= 3:
+                # Adjust flank start to the minimum value with positive gradient
+                min_positive_value = positive_gradient_data[target_col].min()
+                adjusted_flank_start = max(flank_start_value, min_positive_value)
+
+                flank_data = sample_data[
+                    (sample_data[target_col] >= adjusted_flank_start)
+                    & (sample_data[target_col] <= flank_end_value)
+                    & (sample_data[age_col] <= peak_time)
+                    & (sample_data["gradient"] > 0)
+                ].copy()
+
+                # Update the flank_start_value for recording
+                flank_start_value = adjusted_flank_start
+
+        if len(flank_data) < 3:
+            return None
+
+        # Calculate moving tangents over windows
+        flank_time_range = flank_data[age_col].max() - flank_data[age_col].min()
+        window_time = window_size * flank_time_range
+
+        tangent_slopes = []
+        tangent_times = []
+        tangent_values = []
+
+        # Slide window across flank
+        start_time = flank_data[age_col].min()
+        end_time = flank_data[age_col].max() - window_time
+
+        step_size = window_time * 1.1  # 10% overlap
+        current_time = start_time
+
+        while current_time <= end_time:
+            window_end = current_time + window_time
+            window_data = flank_data[
+                (flank_data[age_col] >= current_time)
+                & (flank_data[age_col] <= window_end)
+            ]
+
+            if len(window_data) >= 3:
+                # Linear regression for this window
+                x = window_data[age_col].values
+                y = window_data[target_col].values
+
+                # Use numpy polyfit for linear regression
+                slope, intercept = np.polyfit(x, y, 1)
+
+                # Only consider positive gradients (ascending flank)
+                if slope > 0:
+                    tangent_slopes.append(slope)
+                    tangent_times.append(np.mean(x))
+                    tangent_values.append(np.mean(y))
+
+            current_time += step_size
+
+        if not tangent_slopes:
+            return None
+
+        # Calculate representative tangent (median to avoid outliers)
+        representative_slope = np.median(tangent_slopes)
+        representative_time = np.median(tangent_times)
+        representative_value = np.median(tangent_values)
+
+        # Calculate tangent line parameters
+        # y = mx + b, so b = y - mx
+        tangent_intercept = (
+            representative_value - representative_slope * representative_time
+        )
+        # calculate x intersection
+        # y=0, so x = -b/m
+        x_intersection = (
+            -tangent_intercept / representative_slope
+            if representative_slope != 0
+            else np.nan
+        )
+
+        # Calculate intersection with horizontal line at minimum before tangent_time_s
+        data_before_tangent = sample_data[sample_data[age_col] <= representative_time]
+        if len(data_before_tangent) > 0:
+            min_value_before_tangent = data_before_tangent[target_col].min()
+            # Intersection: y = min_value = slope * x + intercept
+            # x = (y - intercept) / slope
+            x_intersection_min = (
+                (min_value_before_tangent - tangent_intercept) / representative_slope
+                if representative_slope != 0
+                else np.nan
+            )
+        else:
+            min_value_before_tangent = np.nan
+            x_intersection_min = np.nan
+
+        # get normalized_heat_j_g at representative_time
+        tangent_j_g = np.interp(
+            representative_time,
+            sample_data[age_col],
+            sample_data["normalized_heat_j_g"],
+        )
+
+        # get normalized_heat_j_g at peak_time
+        peak_j_g = np.interp(
+            peak_time,
+            sample_data[age_col],
+            sample_data["normalized_heat_j_g"],
+        )
+
+        # get normalized_heat_j_g at x_intersection
+        x_intersection_j_g = (
+            np.interp(
+                x_intersection,
+                sample_data[age_col],
+                sample_data["normalized_heat_j_g"],
+            )
+            if not np.isnan(x_intersection)
+            else np.nan
+        )
+
+        # get normalized_heat_j_g at x_intersection_min
+        x_intersection_dormant_j_g = (
+            np.interp(
+                x_intersection_min,
+                sample_data[age_col],
+                sample_data["normalized_heat_j_g"],
+            )
+            if not np.isnan(x_intersection_min)
+            else np.nan
+        )
+
+        return {
+            "peak_time_s": peak_time,
+            "peak_value": peak_value,
+            "peak_j_g": peak_j_g,
+            "tangent_slope": representative_slope,
+            "tangent_time_s": representative_time,
+            "tangent_value": representative_value,
+            "tangent_intercept": tangent_intercept,
+            "tangent_j_g": tangent_j_g,
+            "flank_start_value": flank_start_value,
+            "flank_end_value": flank_end_value,
+            "n_windows": len(tangent_slopes),
+            "slope_std": np.std(tangent_slopes),
+            "x_intersection": x_intersection,
+            "min_value_before_tangent": min_value_before_tangent,
+            "x_intersection_dormant": x_intersection_min,
+            "x_intersection_dormant_j_g": x_intersection_dormant_j_g,
+            "x_intersection_j_g": x_intersection_j_g,
+        }
+
+    def get_multipeak_tangents(
+        self,
+        data: pd.DataFrame,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Full ascending-flank tangent characteristics for every detected peak.
+
+        Detects all peaks in each sample and applies the same windowed-median
+        tangent logic used for the main peak (:meth:`_flank_tangent_for_peak`)
+        to each of them. The flank baseline is taken as the local minimum in
+        the trough preceding each peak, so that later peaks (e.g. the
+        aluminate/sulfate-depletion peak) are measured from their own onset
+        rather than the dormant minimum.
+
+        Returns one row per peak with ``sample``, ``sample_short``,
+        ``peak_nr`` and all tangent characteristics produced by
+        :meth:`_flank_tangent_for_peak` (``peak_time_s``, ``peak_value``,
+        ``tangent_slope``, ``tangent_intercept``, ``flank_start_value``,
+        ``flank_end_value``, ``x_intersection`` and so on). Rows for which no
+        valid tangent could be determined carry ``peak_time_s``/``peak_value``
+        with the remaining tangent fields set to NaN.
+        """
+        try:
+            from scipy import signal
+
+            cutoff_min = (
+                self.processparams.cutoff.cutoff_min
+                if self.processparams.cutoff.cutoff_min
+                else 0
+            )
+
+            results = []
+
+            for sample, sample_data in SampleIterator.iter_samples(data, regex):
+                sample_short = pathlib.Path(str(sample)).stem
+
+                if cutoff_min > 0:
+                    sample_data = sample_data.query(f"{age_col} >= @cutoff_min * 60")
+
+                sample_data = sample_data.reset_index(drop=True).copy()
+
+                peaks, _ = signal.find_peaks(
+                    sample_data[target_col],
+                    prominence=self.processparams.peakdetection.prominence,
+                    distance=self.processparams.peakdetection.distance,
+                )
+
+                if len(peaks) == 0:
+                    logger.warning(f"No peak found in {sample_short}")
+                    continue
+
+                for peak_nr, peak_idx in enumerate(peaks):
+                    peak_time = sample_data.iloc[peak_idx][age_col]
+                    peak_value = sample_data.iloc[peak_idx][target_col]
+
+                    # Baseline: local minimum in the trough preceding this peak,
+                    # i.e. between the previous peak (or series start) and this one.
+                    prev_boundary = peaks[peak_nr - 1] if peak_nr > 0 else 0
+                    trough_data = sample_data.iloc[prev_boundary : peak_idx + 1]
+                    baseline_value = (
+                        trough_data[target_col].min()
+                        if len(trough_data) > 0
+                        else 0.0
+                    )
+
+                    core = self._flank_tangent_for_peak(
+                        sample_data,
+                        peak_time,
+                        peak_value,
+                        baseline_value,
+                        target_col,
+                        age_col,
+                    )
+
+                    row = {
+                        "sample": sample,
+                        "sample_short": sample_short,
+                        "peak_nr": peak_nr,
+                    }
+                    if core is not None:
+                        row.update(core)
+                    else:
+                        row.update({"peak_time_s": peak_time, "peak_value": peak_value})
+                    results.append(row)
+
+            return pd.DataFrame(results)
+
+        except Exception as e:
+            raise DataProcessingException("get_multipeak_tangents", e)
+
+    @staticmethod
+    def multipeak_params_view(tangents: pd.DataFrame) -> pd.DataFrame:
+        """Reduce full multi-peak tangents to the minimal parameter set.
+
+        Returns one row per peak with ``sample``, ``sample_short``,
+        ``peak_nr``, ``peak_time_s``, ``peak_heat_flow_w_g`` and
+        ``mean_slope_w_g_s``.
+        """
+        if tangents.empty:
+            return tangents
+        return pd.DataFrame(
+            {
+                "sample": tangents["sample"],
+                "sample_short": tangents["sample_short"],
+                "peak_nr": tangents["peak_nr"],
+                "peak_time_s": tangents["peak_time_s"],
+                "peak_heat_flow_w_g": tangents["peak_value"],
+                "mean_slope_w_g_s": tangents["tangent_slope"],
+            }
+        ).reset_index(drop=True)
+
+    def get_multipeak_params(
+        self,
+        data: pd.DataFrame,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Minimal per-peak parameters for measurements with several peaks.
+
+        Thin wrapper around :meth:`get_multipeak_tangents` returning only the
+        peak time, peak heat flow and mean ascending-flank slope for every
+        detected peak.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per peak with ``sample``, ``sample_short``, ``peak_nr``,
+            ``peak_time_s``, ``peak_heat_flow_w_g`` and ``mean_slope_w_g_s``.
+        """
+        tangents = self.get_multipeak_tangents(
+            data, target_col=target_col, age_col=age_col, regex=regex
+        )
+        return self.multipeak_params_view(tangents)
 
 
 class FirstAscendingSlopeAnalyzer:

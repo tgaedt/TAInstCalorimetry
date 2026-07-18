@@ -4,6 +4,7 @@ Refactored main measurement class for calorimetry data handling.
 
 import logging
 import pathlib
+import re
 import warnings
 from typing import Optional, Union
 
@@ -460,6 +461,7 @@ class Measurement:
         peak_width_upper_bounds: Optional[list[float]] = None,
         show_plot: bool = False,
         ax=None,
+        seed_centers: Optional[list[float]] = None,
     ) -> pd.DataFrame:
         """Fit a multi-peak deconvolution model to each sample."""
         params = processparams or self.processparams
@@ -474,6 +476,7 @@ class Measurement:
             baseline_mode=baseline_mode,
             relative_intensity_upper_bounds=relative_intensity_upper_bounds,
             peak_width_upper_bounds=peak_width_upper_bounds,
+            seed_centers=seed_centers,
         )
 
         if show_plot and not result.empty:
@@ -569,6 +572,254 @@ class Measurement:
                     plt.show()
 
         return result
+
+    def detect_peaks_and_shoulders(
+        self,
+        processparams: Optional[ProcessingParameters] = None,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Detect peaks and shoulders in each sample.
+
+        Thin wrapper around
+        :meth:`DeconvolutionAnalyzer.detect_peaks_and_shoulders`. Returns one
+        row per detected feature with ``sample``, ``sample_short``,
+        ``feature_type`` ('peak' or 'shoulder'), ``center_time_s`` and
+        ``heat_flow``.
+        """
+        params = processparams or self.processparams
+        analyzer = DeconvolutionAnalyzer(params)
+        return analyzer.detect_peaks_and_shoulders(
+            self._data, target_col=target_col, age_col=age_col, regex=regex
+        )
+
+    def get_multipeak_deconvolution(
+        self,
+        processparams: Optional[ProcessingParameters] = None,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        baseline_mode: Optional[str] = None,
+        show_plot: bool = False,
+        ax=None,
+        log_y: bool = False,
+    ) -> pd.DataFrame:
+        """Deconvolve each sample using peaks and shoulders as seeds.
+
+        Detects peaks and shoulders per sample (see
+        :meth:`detect_peaks_and_shoulders`) and uses their positions and count
+        to seed a lognormal deconvolution (:meth:`get_deconvolution`). This is
+        a first attempt at handling complex curves whose low-prominence
+        features (e.g. the aluminate/sulfate-depletion shoulder) are not
+        captured by maximum-based seeding alone.
+
+        Parameters
+        ----------
+        processparams : ProcessingParameters, optional
+            Processing parameters, by default the measurement's parameters.
+        target_col, age_col : str
+            Heat flow and time columns.
+        regex : str, optional
+            Regex to filter samples.
+        baseline_mode : str, optional
+            Baseline model used in the fit ('constant', 'linear', 'chebyshev'
+            or 'none'). If None, the value from ``processparams.deconvolution``
+            is used (default 'constant').
+        show_plot : bool
+            Whether to draw the deconvolution together with the detected
+            peak/shoulder seeds for visual control.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If None, a new figure is created per sample.
+        log_y : bool
+            If True, draw the heat-flow axis on a logarithmic scale. Useful to
+            compare the fit of the low-prominence features against the main
+            peak on the same panel.
+
+        Returns
+        -------
+        pd.DataFrame
+            Deconvolution components as returned by :meth:`get_deconvolution`,
+            concatenated over all samples.
+        """
+        params = processparams or self.processparams
+        analyzer = DeconvolutionAnalyzer(params)
+        detections = analyzer.detect_peaks_and_shoulders(
+            self._data, target_col=target_col, age_col=age_col, regex=regex
+        )
+
+        if detections.empty:
+            logger.warning("No peaks or shoulders detected; nothing to deconvolve.")
+            return pd.DataFrame()
+
+        results = []
+        for sample, sample_data in SampleIterator.iter_samples(self._data, regex):
+            sample_short = pathlib.Path(str(sample)).stem
+            sample_detections = detections[detections["sample_short"] == sample_short]
+            if sample_detections.empty:
+                continue
+
+            seed_centers = sorted(sample_detections["center_time_s"].tolist())
+
+            panel_ax = ax
+            created_ax = False
+            if show_plot and panel_ax is None:
+                _, panel_ax = plt.subplots(figsize=(8, 5))
+                created_ax = True
+
+            result = self.get_deconvolution(
+                processparams=params,
+                target_col=target_col,
+                age_col=age_col,
+                regex=re.escape(str(sample)),
+                baseline_mode=baseline_mode,
+                seed_centers=seed_centers,
+                show_plot=show_plot,
+                ax=panel_ax,
+            )
+            results.append(result)
+
+            if show_plot and panel_ax is not None:
+                baseline_x = self._deconvolution_plot_x(
+                    sample_data, params, target_col, age_col
+                )
+                self._overlay_detected_features(
+                    panel_ax,
+                    sample_detections,
+                    result,
+                    baseline_x=baseline_x,
+                    log_y=log_y,
+                )
+                if created_ax:
+                    plt.show()
+
+        if not results:
+            return pd.DataFrame()
+        return pd.concat(results, ignore_index=True)
+
+    @staticmethod
+    def _deconvolution_plot_x(sample_data, params, target_col, age_col):
+        """Return a dense time grid over the fitted (cutoff-applied) range."""
+        working = (
+            sample_data[[age_col, target_col]]
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if params.cutoff.cutoff_min:
+            working = working[working[age_col] >= params.cutoff.cutoff_min * 60]
+        if working.empty:
+            return None
+        return np.linspace(working[age_col].min(), working[age_col].max(), 400)
+
+    @staticmethod
+    def _reconstruct_baseline(result: pd.DataFrame, x: np.ndarray):
+        """Reconstruct the fitted baseline curve over ``x`` from a result frame."""
+        mode = str(result["baseline_mode"].iloc[0]).lower()
+        if mode == "constant":
+            return np.full_like(x, float(result["baseline_constant"].iloc[0]))
+        if mode == "linear":
+            b0 = float(result["baseline_constant"].iloc[0])
+            b1 = float(result["baseline_slope"].iloc[0])
+            return b0 + b1 * x
+        if mode == "chebyshev":
+            coeffs = result["baseline_cheb_coeffs"].iloc[0]
+            if isinstance(coeffs, str):
+                import ast
+
+                coeffs = ast.literal_eval(coeffs)
+            if coeffs is None:
+                return None
+            x_range = max(float(x.max() - x.min()), 1e-12)
+            x_scaled = 2.0 * (x - float(x.min())) / x_range - 1.0
+            return np.polynomial.chebyshev.chebval(
+                x_scaled, np.array(coeffs, dtype=float)
+            )
+        return None
+
+    @staticmethod
+    def _overlay_detected_features(
+        ax,
+        detections: pd.DataFrame,
+        result: Optional[pd.DataFrame] = None,
+        baseline_x: Optional[np.ndarray] = None,
+        log_y: bool = False,
+    ):
+        """Annotate a deconvolution plot for visual control.
+
+        Marks the detected peak/shoulder seeds, draws the fitted baseline,
+        reports the fit quality in a fixed corner so it is easy to compare
+        across panels, and optionally switches the heat-flow axis to a
+        logarithmic scale.
+        """
+        seen_labels = set()
+        for _, feature in detections.iterrows():
+            is_shoulder = feature["feature_type"] == "shoulder"
+            color = "purple" if is_shoulder else "green"
+            label = "Shoulder seed" if is_shoulder else "Peak seed"
+            ax.axvline(
+                feature["center_time_s"],
+                color=color,
+                linestyle=":",
+                alpha=0.6,
+                label=label if label not in seen_labels else None,
+            )
+            ax.plot(
+                feature["center_time_s"],
+                feature["heat_flow"],
+                marker="v" if is_shoulder else "o",
+                color=color,
+                markersize=7,
+            )
+            seen_labels.add(label)
+
+        # Draw the fitted baseline so its shape can be judged.
+        if (
+            result is not None
+            and not result.empty
+            and baseline_x is not None
+            and "baseline_mode" in result.columns
+        ):
+            baseline_y = Measurement._reconstruct_baseline(result, baseline_x)
+            if baseline_y is not None:
+                ax.plot(
+                    baseline_x,
+                    baseline_y,
+                    color="dimgray",
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.9,
+                    label=f"baseline ({result['baseline_mode'].iloc[0]})",
+                )
+
+        # Log-scale the heat-flow axis with a positive floor so the tail and
+        # low-prominence features remain visible.
+        if log_y:
+            heat_max = float(detections["heat_flow"].max())
+            floor = max(heat_max * 1e-4, 1e-9)
+            ax.set_yscale("log")
+            ax.set_ylim(bottom=floor, top=heat_max * 1.5)
+
+        # Report fit quality in a fixed corner for easy comparison.
+        if result is not None and not result.empty and "fit_r2" in result.columns:
+            fit_r2 = result["fit_r2"].iloc[0]
+            fit_rmse = (
+                result["fit_rmse"].iloc[0] if "fit_rmse" in result.columns else np.nan
+            )
+            text = f"R² = {fit_r2:.3f}"
+            if pd.notna(fit_rmse):
+                text += f"\nRMSE = {fit_rmse:.2e}"
+            ax.text(
+                0.97,
+                0.97,
+                text,
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+            )
+
+        ax.legend(fontsize=8, labelspacing=0.1)
 
     def get_left_peak_inflection_tangent_intersection(
         self,
@@ -803,6 +1054,140 @@ class Measurement:
             )
 
         return combined_results
+
+    def get_multipeak_params(
+        self,
+        processparams: Optional[ProcessingParameters] = None,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        show_plot: bool = False,
+        axs=None,
+    ) -> pd.DataFrame:
+        """Get a minimal set of per-peak parameters for multi-peak measurements.
+
+        Unlike :meth:`get_mainpeak_params`, which characterizes only the main
+        silicate reaction, this returns one row per detected peak with its
+        time, heat flow and mean ascending-flank slope. Intended for cements
+        whose calorimetry curve shows several hydration peaks (e.g. an
+        additional aluminate/sulfate-depletion peak).
+
+        When ``show_plot`` is True, a control plot with one panel per detected
+        peak is produced so the researcher can verify that the flank and
+        tangent were detected appropriately for each peak.
+
+        Parameters
+        ----------
+        processparams : ProcessingParameters, optional
+            Processing parameters, by default the measurement's parameters.
+        target_col : str
+            Column containing heat flow data. The default is
+            'normalized_heat_flow_w_g'.
+        age_col : str
+            Column containing time data. The default is 'time_s'.
+        regex : str, optional
+            Regex to filter samples, by default None.
+        show_plot : bool
+            Whether to draw a per-peak control plot of the slope detection.
+        axs : sequence of matplotlib.axes.Axes, optional
+            Axes to draw the per-peak panels on (one per detected peak). If
+            None, a new figure with one panel per peak is created per sample.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per peak with ``sample``, ``sample_short``, ``peak_nr``,
+            ``peak_time_s``, ``peak_heat_flow_w_g`` and ``mean_slope_w_g_s``.
+        """
+        params = processparams or self.processparams
+        analyzer = FlankTangentAnalyzer(params)
+        tangents = analyzer.get_multipeak_tangents(
+            self._data,
+            target_col=target_col,
+            age_col=age_col,
+            regex=regex,
+        )
+
+        if show_plot and not tangents.empty:
+            self._plot_multipeak_slopes(
+                tangents, params, target_col, age_col, regex, axs
+            )
+
+        return analyzer.multipeak_params_view(tangents)
+
+    def _plot_multipeak_slopes(
+        self,
+        tangents: pd.DataFrame,
+        params: ProcessingParameters,
+        target_col: str,
+        age_col: str,
+        regex: Optional[str],
+        axs=None,
+    ) -> None:
+        """Draw a per-peak control plot of the multi-peak slope detection.
+
+        Recycles :meth:`SimplePlotter._plot_flank_tangent_elements` (the same
+        flank/tangent overlay used for the main-peak analysis) once per
+        detected peak, zooming each panel onto its flank so the researcher can
+        confirm the detection.
+        """
+        for sample, sample_data in SampleIterator.iter_samples(self._data, regex):
+            sample_short = pathlib.Path(str(sample)).stem
+            sample_tangents = tangents[
+                (tangents["sample_short"] == sample_short)
+                & tangents["tangent_slope"].notna()
+            ]
+            if sample_tangents.empty:
+                continue
+
+            plot_data = sample_data
+            if params.cutoff.cutoff_min:
+                plot_data = plot_data[
+                    plot_data[age_col] >= params.cutoff.cutoff_min * 60
+                ]
+            plot_data = plot_data.reset_index(drop=True)
+
+            n_peaks = len(sample_tangents)
+            if axs is None:
+                _, panel_axes = plt.subplots(
+                    1, n_peaks, figsize=(5 * n_peaks, 4), squeeze=False
+                )
+                panel_axes = panel_axes[0]
+            else:
+                panel_axes = np.atleast_1d(axs)
+
+            for panel_ax, (_, row) in zip(panel_axes, sample_tangents.iterrows()):
+                panel_ax.plot(
+                    plot_data[age_col],
+                    plot_data[target_col],
+                    color="gray",
+                    alpha=0.7,
+                    label="Data",
+                )
+                self._plotter._plot_flank_tangent_elements(
+                    panel_ax,
+                    plot_data,
+                    row.to_frame().T,
+                    sample_short,
+                    age_col,
+                    target_col,
+                )
+
+                # Zoom onto this peak's flank for a legible control view.
+                peak_time = row["peak_time_s"]
+                peak_value = row["peak_value"]
+                x_int = row.get("x_intersection", np.nan)
+                flank_start = x_int if pd.notna(x_int) else row.get("tangent_time_s", np.nan)
+                if pd.notna(flank_start) and peak_time > flank_start:
+                    span = peak_time - flank_start
+                else:
+                    span = max(peak_time * 0.3, 1.0)
+                    flank_start = peak_time - span
+                left = max(plot_data[age_col].min(), flank_start - 0.3 * span)
+                panel_ax.set_xlim(left, peak_time + 0.7 * span)
+                panel_ax.set_ylim(bottom=min(0.0, row.get("min_value_before_tangent", 0.0)), top=peak_value * 1.2)
+                panel_ax.set_title(f"{sample_short} — peak {int(row['peak_nr'])}")
+                panel_ax.legend(fontsize=7, labelspacing=0.1)
 
     def _calculate_first_ascending_slope_analysis(
         self,

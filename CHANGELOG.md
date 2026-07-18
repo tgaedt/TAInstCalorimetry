@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.4] - 2026-05-23
+## [0.3.4] - 2026-05-28
 
 ### Added
 
@@ -27,7 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   # later, in another script
   m = Measurement.load("run01.pkl")
   ```
-### Added
 
 - **`Measurement.get_data_with_metadata()`.** Returns the measurement data
   joined with its added metadata as one tidy DataFrame, ready to export with
@@ -35,14 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and after `average_by_metadata` (joining on the group label and attaching
   only metadata that is constant within each group). Returns the data unchanged
   when no metadata has been added.
-### Fixed
-
-- **Adaptive downsampling works again.** `Measurement(..., processparams=pp)`
-  with `pp.downsample.apply = True` had silently returned the full-resolution
-  data since the package refactor, because `_apply_adaptive_downsampling` was
-  left as a no-op stub. It now downsamples per sample as documented.
-- **`UnivariateSpline` "s too small" warning removed.** The spline fit during
-  downsampling no longer emits a non-convergence `UserWarning`.
 
 ### Changed
 
@@ -52,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value behaves consistently regardless of heat-flow magnitude. The default
   changed from `1e-10` to `1e-6`. This changes which points adaptive
   downsampling selects.
+
+### Fixed
+
+- **Adaptive downsampling works again.** `Measurement(..., processparams=pp)`
+  with `pp.downsample.apply = True` had silently returned the full-resolution
+  data since the package refactor, because `_apply_adaptive_downsampling` was
+  left as a no-op stub. It now downsamples per sample as documented.
+- **`UnivariateSpline` "s too small" warning removed.** The spline fit during
+  downsampling no longer emits a non-convergence `UserWarning`.
 
 ## [0.3.3] - 2026-05-06
 

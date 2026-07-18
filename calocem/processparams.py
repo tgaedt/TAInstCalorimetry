@@ -248,6 +248,10 @@ class DeconvolutionParameters:
     min_peak_time_separation_fraction: float = 1e-4
     relative_intensity_upper_bounds: list[float] | None = None
     peak_width_upper_bounds: list[float] | None = None
+    # peak/shoulder detection used to seed the deconvolution
+    savgol_window: int = 21
+    savgol_polyorder: int = 3
+    shoulder_curvature_fraction: float = 0.05
 
 
 @dataclass

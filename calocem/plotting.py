@@ -795,7 +795,7 @@ class SimplePlotter:
             )
 
         intersection_abscissa = results.get("onset_time_s_max_slope_abcissa", np.nan)
-        if np.isnan(intersection_abscissa):
+        if np.isfinite(intersection_abscissa):
             ax.axvline(
                 x=intersection_abscissa,
                 color="blue",
@@ -803,7 +803,6 @@ class SimplePlotter:
                 alpha=0.7,
                 label=f"Onset Intersection: {intersection_abscissa:.0f}s",
             )
-            # ax.set_title(f"Ascending Flank Tangent Analysis - {sample}")
 
         ax.set_title(f"Ascending Flank Tangent Analysis - {sample}")
 
