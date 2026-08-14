@@ -18,7 +18,7 @@ from .data_processing import (
     SampleIterator,
 )
 from .exceptions import DataProcessingException
-from .processparams import ProcessingParameters
+from .processparams import DeconvolutionConstraints, ProcessingParameters
 
 logger = logging.getLogger(__name__)
 
@@ -1226,13 +1226,17 @@ class ConstrainedDeconvolutionAnalyzer:
         weighting: str = "none",
         n_starts: int = 12,
         seed: int = 0,
-        sample_specs: Optional[dict[str, dict]] = None,
+        constraints: Optional[DeconvolutionConstraints] = None,
+        sample_specs: Optional[dict] = None,
     ) -> pd.DataFrame:
         """Fit ``n_peaks`` components under area and timing boundary conditions.
 
-        When ``sample_specs`` is given, only the samples it names are fitted and
-        each one uses the settings it carries, falling back to the arguments of
-        this call for everything it does not name.
+        ``constraints`` states the conditions as one entry per component and
+        replaces the corresponding arguments of this call. ``sample_specs``
+        does the same per sample: only the samples it names are fitted, and each
+        uses its own conditions, given either as a
+        :class:`~calocem.processparams.DeconvolutionConstraints` or as a dict of
+        arguments, falling back to this call for whatever it does not state.
         """
         try:
             from scipy.optimize import minimize
@@ -1252,6 +1256,10 @@ class ConstrainedDeconvolutionAnalyzer:
                 "weighting": weighting,
                 "n_starts": n_starts,
             }
+            if constraints is not None:
+                defaults = {**defaults, **self._as_overrides(constraints, "constraints")}
+
+            sample_specs = self._normalise_sample_specs(sample_specs)
             self._validate_sample_specs(sample_specs, defaults)
 
             rng = np.random.default_rng(seed)
@@ -1351,18 +1359,35 @@ class ConstrainedDeconvolutionAnalyzer:
             raise DataProcessingException("get_constrained_deconvolution", e)
 
     @staticmethod
+    def _as_overrides(spec, where: str) -> dict:
+        """Accept either a DeconvolutionConstraints or a plain dict of settings."""
+        if isinstance(spec, DeconvolutionConstraints):
+            return spec.to_kwargs()
+        if isinstance(spec, dict):
+            return spec
+        raise ValueError(
+            f"{where} must be a DeconvolutionConstraints or a dict of settings"
+        )
+
+    @classmethod
+    def _normalise_sample_specs(cls, sample_specs):
+        """Turn every per-sample entry into a plain dict of settings."""
+        if sample_specs is None:
+            return None
+        if not isinstance(sample_specs, dict):
+            raise ValueError("sample_specs must be a dict keyed by sample_short")
+        return {
+            sample_short: cls._as_overrides(spec, f"sample_specs['{sample_short}']")
+            for sample_short, spec in sample_specs.items()
+        }
+
+    @staticmethod
     def _validate_sample_specs(sample_specs, defaults):
         """Reject malformed per-sample specifications before any fitting."""
         if sample_specs is None:
             return
-        if not isinstance(sample_specs, dict):
-            raise ValueError("sample_specs must be a dict keyed by sample_short")
 
         for sample_short, overrides in sample_specs.items():
-            if not isinstance(overrides, dict):
-                raise ValueError(
-                    f"sample_specs['{sample_short}'] must be a dict of settings"
-                )
             unknown = sorted(set(overrides) - set(defaults))
             if unknown:
                 raise ValueError(

@@ -35,7 +35,7 @@ from .file_io import (
     save_measurement,
 )
 from .plotting import SimplePlotter
-from .processparams import ProcessingParameters
+from .processparams import DeconvolutionConstraints, ProcessingParameters
 from .utils import adaptive_downsample, downsample_sections
 
 logger = logging.getLogger(__name__)
@@ -1862,6 +1862,7 @@ class Measurement:
         weighting: str = "none",
         n_starts: int = 12,
         seed: int = 0,
+        constraints: Optional[DeconvolutionConstraints] = None,
         sample_specs: Optional[dict] = None,
         show_plot: bool = False,
         ax=None,
@@ -1940,9 +1941,16 @@ class Measurement:
             jittered within the bounds.
         seed : int
             Seed for the jittered starting points.
+        constraints : DeconvolutionConstraints, optional
+            Boundary conditions stated as one ``PeakConstraints`` per
+            component, with the number of components and the reference taken
+            from it. Replaces the individual bound arguments above and lets the
+            times be given in a declared unit rather than in seconds.
         sample_specs : dict, optional
-            Per-sample settings, keyed by ``sample_short``. Only the samples
-            named are fitted, and each uses its own settings, falling back to
+            Per-sample settings, keyed by ``sample_short``, each either a
+            ``DeconvolutionConstraints`` or a dict of the arguments above. Only
+            the samples named are fitted, and each uses its own settings,
+            falling back to
             the arguments of this call for anything it does not name. Any of
             ``n_peaks``, ``peak_shape``, ``peak_time_bounds``,
             ``peak_time_delta_bounds``, ``reference_component``,
@@ -1993,6 +2001,7 @@ class Measurement:
             weighting=weighting,
             n_starts=n_starts,
             seed=seed,
+            constraints=constraints,
             sample_specs=sample_specs,
         )
 

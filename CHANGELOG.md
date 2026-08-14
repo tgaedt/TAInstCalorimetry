@@ -9,35 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`Measurement.get_baseline()` and `Measurement.get_baseline_corrected_data()`.**
-  A simple linear baseline for the heat-flow curve, fitted as the straight line
-  through two anchor points. By default the first anchor is the heat-flow
-  minimum of the dormant period and the second the last point of the curve; both
-  can be placed explicitly. The heat flow at an anchor is averaged over
-  `ProcessingParameters.baseline.window_s` to suppress noise. `get_baseline`
-  returns slope, intercept and both anchors per sample and leaves the
-  measurement unchanged; `get_baseline_corrected_data` returns a copy of the
-  data with an additional `<target_col>_baseline_corrected` column.
-
-  ```python
-  baseline = m.get_baseline(processparams, show_plot=True)
-  corrected = m.get_baseline_corrected_data(processparams, anchor_start_s=8 * 3600)
-  ```
-
-  With `inplace=True` the corrected column is attached to the measurement, so
-  that it can be used by any analysis accepting `target_col`. In particular it
-  allows the baseline to be fixed before a deconvolution instead of being fitted
-  along with the peaks:
-
-  ```python
-  m.get_baseline_corrected_data(processparams, inplace=True)
-  deconv = m.get_deconvolution(
-      processparams,
-      target_col="normalized_heat_flow_w_g_baseline_corrected",
-      baseline_mode="none",
-  )
-  ```
-
 - **`Measurement.get_constrained_deconvolution()`.** Deconvolution under
   boundary conditions on area ratios and peak timings. Each component is
   parameterised by the heat it contributes inside the fit window instead of by
@@ -54,6 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit of the width itself, seconds for `fraser_suzuki` and `gaussian` and the
   dimensionless log-time width for `lognormal`; a `None` entry falls back to the
   global `width_bounds`.
+
+  **`PeakConstraints` and `DeconvolutionConstraints`.** The boundary conditions
+  can be stated as one object per component instead of as four index-aligned
+  lists. The component count and the reference component follow from the list of
+  peaks, and `time_unit` is declared once so times need no conversion factor.
+  Pass one as `constraints=` for all samples, or per sample in `sample_specs`.
+
+  ```python
+  from calocem import DeconvolutionConstraints, PeakConstraints
+
+  four_peaks = DeconvolutionConstraints(
+      time_unit="h",
+      peaks=[
+          PeakConstraints(time=(6, 18), area=(0.55, 0.95), width=(3, 20)),
+          PeakConstraints(delta=(2, 12), area=(0.01, 0.20), width=(1, 10)),
+          PeakConstraints(delta=(8, 25), area=(0.01, 0.20), width=(1, 20)),
+          PeakConstraints(delta=(15, 45), area=(0.01, 0.20), width=(1, 30)),
+      ],
+  )
+  deconv = m.get_constrained_deconvolution(processparams, constraints=four_peaks)
+  ```
 
   `sample_specs` selects which files are fitted and gives each one its own
   settings, keyed by `sample_short`, as either a `DeconvolutionConstraints` or a
@@ -90,6 +82,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       n_peaks=3,
       peak_time_bounds=[(6 * 3600, 18 * 3600), (12 * 3600, 30 * 3600), (25 * 3600, 60 * 3600)],
       area_fraction_bounds=[(0.55, 0.90), (0.05, 0.30), (0.02, 0.20)],
+  )
+  ```
+
+- **`Measurement.get_baseline()` and `Measurement.get_baseline_corrected_data()`.**
+  A simple linear baseline for the heat-flow curve, fitted as the straight line
+  through two anchor points. By default the first anchor is the heat-flow
+  minimum of the dormant period and the second the last point of the curve; both
+  can be placed explicitly. The heat flow at an anchor is averaged over
+  `ProcessingParameters.baseline.window_s` to suppress noise. `get_baseline`
+  returns slope, intercept and both anchors per sample and leaves the
+  measurement unchanged; `get_baseline_corrected_data` returns a copy of the
+  data with an additional `<target_col>_baseline_corrected` column.
+
+  ```python
+  baseline = m.get_baseline(processparams, show_plot=True)
+  corrected = m.get_baseline_corrected_data(processparams, anchor_start_s=8 * 3600)
+  ```
+
+  With `inplace=True` the corrected column is attached to the measurement, so
+  that it can be used by any analysis accepting `target_col`. In particular it
+  allows the baseline to be fixed before a deconvolution instead of being fitted
+  along with the peaks:
+
+  ```python
+  m.get_baseline_corrected_data(processparams, inplace=True)
+  deconv = m.get_deconvolution(
+      processparams,
+      target_col="normalized_heat_flow_w_g_baseline_corrected",
+      baseline_mode="none",
   )
   ```
 

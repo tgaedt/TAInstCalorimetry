@@ -254,6 +254,160 @@ class DeconvolutionParameters:
     shoulder_curvature_fraction: float = 0.05
 
 
+TIME_UNIT_SECONDS = {"s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+@dataclass
+class PeakConstraints:
+    """
+    Boundary conditions for a single deconvolution component.
+
+    Every field is an interval or None, and None leaves that property free.
+    Times are expressed in the ``time_unit`` of the enclosing
+    :class:`DeconvolutionConstraints`.
+
+    Attributes
+    ----------
+    time: tuple
+        Allowed interval for the absolute position of the peak.
+    delta: tuple
+        Allowed interval for the offset of the peak from the reference
+        component, negative for a component preceding it. The reference
+        component itself must not have one.
+    area: tuple
+        Allowed share of the total fitted heat, between 0 and 1.
+    width: tuple
+        Allowed interval for the width of the peak. For the Fraser-Suzuki shape
+        this is the full width at half maximum in the symmetric limit, for the
+        Gaussian the standard deviation, and for the lognormal shape the
+        dimensionless width in log time, which is not converted by ``time_unit``.
+    reference: bool
+        Marks this component as the one the offsets refer to. At most one
+        component may be marked; if none is, the first is used.
+    """
+
+    time: tuple[float, float] | None = None
+    delta: tuple[float, float] | None = None
+    area: tuple[float, float] | None = None
+    width: tuple[float, float] | None = None
+    reference: bool = False
+
+
+@dataclass
+class DeconvolutionConstraints:
+    """
+    Boundary conditions of one sample, given as one entry per component.
+
+    The number of components follows from the length of ``peaks``, so it does
+    not have to be stated separately, and each component carries its own
+    conditions instead of them being spread over several parallel lists.
+
+    Attributes
+    ----------
+    peaks: list
+        One :class:`PeakConstraints` per component, in order of increasing
+        peak time.
+    peak_shape: str
+        'fraser_suzuki' (default), 'lognormal' or 'gaussian'.
+    total_heat: tuple
+        Allowed interval for the sum of the component areas in J/g.
+    shared_asymmetry: bool
+        Whether one asymmetry is fitted for all components. Default is True.
+    asymmetry: tuple
+        Bounds on the asymmetry, applied to every component.
+    weighting: str
+        'none' (default) or 'inverse'.
+    n_starts: int
+        Number of starting points for the fit.
+    time_unit: str
+        Unit of every time in this specification: 's' (default), 'min', 'h' or
+        'd'. Declaring it once avoids repeating a conversion factor.
+
+    Examples
+    --------
+
+    >>> constraints = DeconvolutionConstraints(
+    ...     time_unit="h",
+    ...     peaks=[
+    ...         PeakConstraints(time=(6, 18), area=(0.55, 0.95), width=(3, 20)),
+    ...         PeakConstraints(delta=(2, 12), area=(0.01, 0.20), width=(1, 10)),
+    ...     ],
+    ... )
+    """
+
+    peaks: list[PeakConstraints] = field(default_factory=list)
+    peak_shape: str = "fraser_suzuki"
+    total_heat: tuple[float, float] | None = None
+    shared_asymmetry: bool = True
+    asymmetry: tuple[float, float] = (0.05, 3.0)
+    weighting: str = "none"
+    n_starts: int = 12
+    time_unit: str = "s"
+
+    def __post_init__(self):
+        if not self.peaks:
+            raise ValueError("DeconvolutionConstraints needs at least one peak")
+        if self.time_unit not in TIME_UNIT_SECONDS:
+            raise ValueError(
+                f"time_unit must be one of {sorted(TIME_UNIT_SECONDS)}"
+            )
+        if sum(bool(peak.reference) for peak in self.peaks) > 1:
+            raise ValueError("only one component can be the reference")
+        if self.peaks[self.reference_component - 1].delta is not None:
+            raise ValueError(
+                "the reference component cannot have a delta to itself"
+            )
+
+    @property
+    def n_peaks(self) -> int:
+        return len(self.peaks)
+
+    @property
+    def reference_component(self) -> int:
+        """Position of the reference component, counted from one."""
+        for index, peak in enumerate(self.peaks, start=1):
+            if peak.reference:
+                return index
+        return 1
+
+    def to_kwargs(self) -> dict:
+        """Return these conditions as arguments of get_constrained_deconvolution."""
+        time_factor = TIME_UNIT_SECONDS[self.time_unit]
+        # The lognormal width lives in log time and carries no unit.
+        width_factor = 1.0 if self.peak_shape == "lognormal" else time_factor
+
+        def scaled(field_name: str, factor: float):
+            values = [getattr(peak, field_name) for peak in self.peaks]
+            if all(value is None for value in values):
+                return None
+            return [
+                None if value is None else (value[0] * factor, value[1] * factor)
+                for value in values
+            ]
+
+        areas = [peak.area for peak in self.peaks]
+        if all(area is None for area in areas):
+            area_bounds = None
+        else:
+            # An unconstrained component is free to take any share.
+            area_bounds = [(0.0, 1.0) if area is None else area for area in areas]
+
+        return {
+            "n_peaks": self.n_peaks,
+            "peak_shape": self.peak_shape,
+            "peak_time_bounds": scaled("time", time_factor),
+            "peak_time_delta_bounds": scaled("delta", time_factor),
+            "peak_width_bounds": scaled("width", width_factor),
+            "area_fraction_bounds": area_bounds,
+            "reference_component": self.reference_component,
+            "total_heat_bounds": self.total_heat,
+            "asymmetry_bounds": self.asymmetry,
+            "shared_asymmetry": self.shared_asymmetry,
+            "weighting": self.weighting,
+            "n_starts": self.n_starts,
+        }
+
+
 @dataclass
 class BaselineParameters:
     """
