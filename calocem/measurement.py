@@ -16,6 +16,7 @@ from .analysis import (
     ASTMC1679Analyzer,
     AverageSlopeAnalyzer,
     BaselineAnalyzer,
+    ConstrainedDeconvolutionAnalyzer,
     DeconvolutionAnalyzer,
     DormantPeriodAnalyzer,
     FirstAscendingSlopeAnalyzer,
@@ -1840,6 +1841,173 @@ class Measurement:
             return dorm_hf
         else:
             return pd.DataFrame()
+
+    def get_constrained_deconvolution(
+        self,
+        processparams: Optional[ProcessingParameters] = None,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        n_peaks: int = 3,
+        peak_shape: str = "fraser_suzuki",
+        peak_time_bounds: Optional[list] = None,
+        peak_time_delta_bounds: Optional[list] = None,
+        reference_component: int = 1,
+        area_fraction_bounds: Optional[list] = None,
+        peak_width_bounds: Optional[list] = None,
+        total_heat_bounds: Optional[tuple] = None,
+        asymmetry_bounds: tuple = (0.05, 3.0),
+        width_bounds: tuple = (0.01, 2.0),
+        shared_asymmetry: bool = True,
+        weighting: str = "none",
+        n_starts: int = 12,
+        seed: int = 0,
+        sample_specs: Optional[dict] = None,
+        show_plot: bool = False,
+        ax=None,
+        xunit: str = "h",
+    ) -> pd.DataFrame:
+        """Deconvolve under boundary conditions on area ratios and peak timings.
+
+        Unlike :meth:`get_deconvolution`, each component is parameterised by the
+        heat it contributes inside the fit window, so the constraints act on
+        areas rather than on amplitudes. For asymmetric components of unequal
+        width the two differ substantially.
+
+        Parameters
+        ----------
+        processparams : ProcessingParameters, optional
+            Processing parameters, by default the measurement's parameters.
+            ``cutoff.cutoff_min``, ``deconvolution.max_fit_points``,
+            ``deconvolution.max_nfev``, ``deconvolution.min_points`` and
+            ``deconvolution.min_peak_time_separation_fraction`` are used.
+        target_col, age_col : str
+            Heat flow and time columns. Pass the baseline-corrected column here
+            when the baseline has been subtracted beforehand.
+        regex : str, optional
+            Regex to filter samples.
+        n_peaks : int
+            Number of components.
+        peak_shape : str
+            'fraser_suzuki' (default), 'lognormal' or 'gaussian'. Only the
+            Fraser-Suzuki function separates width from asymmetry.
+        peak_time_bounds : list of (float, float) or None, optional
+            Allowed interval for each peak position in seconds, one entry per
+            component. This is how absolute timings are prescribed. A ``None``
+            entry leaves that component free.
+        peak_time_delta_bounds : list of (float, float) or None, optional
+            Allowed interval for the offset of each peak from the reference
+            component, in seconds, one entry per component. Use this when the
+            spacing between the peaks is known better than their absolute
+            position, which is usually the case across a series of samples
+            whose main peak shifts. The entry for the reference component must
+            be ``None``. Offsets are negative for components preceding the
+            reference. Combines with ``peak_time_bounds``: the reference is
+            normally placed by an absolute interval and the others relative to
+            it.
+        reference_component : int
+            Component the deltas refer to, counted from one in order of
+            increasing peak time. Default is 1, the earliest component.
+        area_fraction_bounds : list of (float, float), optional
+            Allowed share of the total fitted heat for each component, one
+            entry per component. The upper limits must sum to at least one and
+            the lower limits to at most one.
+        peak_width_bounds : list of (float, float) or None, optional
+            Allowed interval for the width of each component, one entry per
+            component. A ``None`` entry falls back to ``width_bounds``. The unit
+            is that of the width itself: seconds for 'fraser_suzuki' and
+            'gaussian', and the dimensionless log-time width for 'lognormal'.
+            For the Fraser-Suzuki shape the width is the full width at half
+            maximum in the symmetric limit, for the Gaussian it is the standard
+            deviation.
+        total_heat_bounds : (float, float), optional
+            Allowed interval for the sum of the component areas in J/g.
+        asymmetry_bounds, width_bounds : (float, float)
+            Bounds on the shape parameters, applied to every component.
+            ``width_bounds`` is given relative to the duration of the
+            measurement and is the fallback for components not covered by
+            ``peak_width_bounds``.
+        shared_asymmetry : bool
+            If True (default), one asymmetry is fitted for all components. Where
+            the descending flank carries little structure, the asymmetry of the
+            weak components is otherwise essentially unconstrained.
+        weighting : str
+            'none' (default) or 'inverse'. Inverse weighting divides the
+            residual by the local heat flow, which stops the main peak from
+            dominating the sum of squares.
+        n_starts : int
+            Number of starting points. The first is deterministic, the rest are
+            jittered within the bounds.
+        seed : int
+            Seed for the jittered starting points.
+        sample_specs : dict, optional
+            Per-sample settings, keyed by ``sample_short``. Only the samples
+            named are fitted, and each uses its own settings, falling back to
+            the arguments of this call for anything it does not name. Any of
+            ``n_peaks``, ``peak_shape``, ``peak_time_bounds``,
+            ``peak_time_delta_bounds``, ``reference_component``,
+            ``area_fraction_bounds``, ``peak_width_bounds``,
+            ``total_heat_bounds``, ``asymmetry_bounds``, ``width_bounds``,
+            ``shared_asymmetry``, ``weighting`` and ``n_starts`` may be given
+            per sample. A name that matches no sample raises, so that typos are
+            not silently ignored.
+        show_plot : bool
+            Draw the measured curve, the components and their sum per sample.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If None, one figure is created per sample.
+        xunit : str
+            Time unit of the x-axis of the plot ('s', 'min', 'h' or 'd').
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per component, with ``component_area`` in J/g,
+            ``component_area_fraction``, the shape parameters including
+            ``asymmetry``, the offset from the reference component in
+            ``peak_time_delta_s``, and two diagnostics: ``n_starts_converged`` and
+            ``optimum_hit_fraction``, the share of converged starts that reached
+            the reported optimum again. A value well below one means the
+            objective has several distinct minima under the given boundary
+            conditions, and the reported split is one of them rather than the
+            solution.
+        """
+        params = processparams or self.processparams
+
+        analyzer = ConstrainedDeconvolutionAnalyzer(params)
+        result = analyzer.get_constrained_deconvolution(
+            self._data,
+            target_col=target_col,
+            age_col=age_col,
+            regex=regex,
+            n_peaks=n_peaks,
+            peak_shape=peak_shape,
+            peak_time_bounds=peak_time_bounds,
+            peak_time_delta_bounds=peak_time_delta_bounds,
+            reference_component=reference_component,
+            area_fraction_bounds=area_fraction_bounds,
+            peak_width_bounds=peak_width_bounds,
+            total_heat_bounds=total_heat_bounds,
+            asymmetry_bounds=asymmetry_bounds,
+            width_bounds=width_bounds,
+            shared_asymmetry=shared_asymmetry,
+            weighting=weighting,
+            n_starts=n_starts,
+            seed=seed,
+            sample_specs=sample_specs,
+        )
+
+        if show_plot and not result.empty:
+            self._plotter.plot_deconvolution_components(
+                self._data,
+                result,
+                ax=ax,
+                age_col=age_col,
+                target_col=target_col,
+                xunit=xunit,
+                cutoff_time_min=params.cutoff.cutoff_min,
+            )
+
+        return result
 
     def get_baseline(
         self,

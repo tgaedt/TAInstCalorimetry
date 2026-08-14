@@ -1342,6 +1342,99 @@ class SimplePlotter:
         ax.grid(True, alpha=0.3)
         return ax
 
+    def plot_deconvolution_components(
+        self,
+        data: pd.DataFrame,
+        result: pd.DataFrame,
+        ax: Optional[matplotlib.axes.Axes] = None,
+        age_col: str = "time_s",
+        target_col: str = "normalized_heat_flow_w_g",
+        xunit: str = "h",
+        cutoff_time_min: Optional[float] = None,
+    ):
+        """Plot measured curve, fitted components and their sum, one panel per sample.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Full measurement data.
+        result : pd.DataFrame
+            Output of get_constrained_deconvolution(), one row per component.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If None, one figure is created per sample.
+        age_col, target_col : str
+            Time and heat flow columns.
+        xunit : str
+            Time unit for the x-axis: 's', 'min', 'h', or 'd'.
+        cutoff_time_min : float, optional
+            Restrict the drawn range to the interval that was fitted.
+        """
+        from .analysis import ConstrainedDeconvolutionAnalyzer
+
+        unit_conversions = {
+            "s": (1.0, "Time [s]"),
+            "min": (1 / 60, "Time [min]"),
+            "h": (1 / 3600, "Time [h]"),
+            "d": (1 / (24 * 3600), "Time [d]"),
+        }
+        x_factor, x_label = unit_conversions.get(xunit, (1.0, "Time [s]"))
+
+        axes = []
+        for sample_short, sample_result in result.groupby("sample_short"):
+            sample_data = data[data["sample_short"] == sample_short]
+            if cutoff_time_min:
+                sample_data = sample_data[sample_data[age_col] >= cutoff_time_min * 60]
+            sample_data = sample_data.dropna(subset=[age_col, target_col])
+            if sample_data.empty:
+                continue
+
+            panel = ax if ax is not None else plt.subplots(figsize=(10, 6))[1]
+            axes.append(panel)
+
+            x = sample_data[age_col].to_numpy(dtype=float)
+            panel.plot(
+                x * x_factor,
+                sample_data[target_col].to_numpy(dtype=float),
+                color="black",
+                linewidth=1.2,
+                label="measured",
+            )
+
+            shape = str(sample_result["peak_shape"].iloc[0]).lower()
+            shape_fn = ConstrainedDeconvolutionAnalyzer._shape_function(shape)
+
+            total = np.zeros_like(x)
+            for _, row in sample_result.sort_values("component").iterrows():
+                curve = float(row["amplitude"]) * shape_fn(
+                    x,
+                    float(row["center_time_s"]),
+                    float(row["width"]),
+                    float(row.get("asymmetry", 0.0) or 0.0),
+                )
+                total += curve
+                panel.fill_between(
+                    x * x_factor,
+                    curve,
+                    alpha=0.25,
+                    label=(
+                        f"component {int(row['component'])} "
+                        f"({row['component_area_fraction'] * 100:.0f} %)"
+                    ),
+                )
+
+            panel.plot(
+                x * x_factor, total, linestyle="--", color="red", label="sum of components"
+            )
+            panel.set_xlabel(x_label)
+            panel.set_ylabel("Normalized Heat Flow / [W/g]")
+            panel.set_title(
+                f"{sample_short} (R² = {sample_result['fit_r2'].iloc[0]:.4f})"
+            )
+            panel.legend(fontsize="small")
+            panel.grid(True, alpha=0.3)
+
+        return axes
+
     def plot_baseline(
         self,
         data: pd.DataFrame,

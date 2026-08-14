@@ -38,6 +38,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   )
   ```
 
+- **`Measurement.get_constrained_deconvolution()`.** Deconvolution under
+  boundary conditions on area ratios and peak timings. Each component is
+  parameterised by the heat it contributes inside the fit window instead of by
+  its amplitude, so `area_fraction_bounds` acts on areas; the existing
+  `relative_intensity_upper_bounds` of `get_deconvolution` bounds amplitude
+  ratios, which differ for asymmetric components of unequal width.
+  `peak_time_bounds` prescribes an interval for each peak position,
+  `peak_time_delta_bounds` an interval for the offset of each peak from a
+  `reference_component` (component 1 by default), `peak_width_bounds` an
+  interval for each peak width, and `total_heat_bounds` an interval for the sum
+  of the component areas. Offsets are useful across a series whose main peak
+  shifts, where the spacing between components is known better than their
+  absolute position; the fitted offset is reported in `peak_time_delta_s`. Width bounds are given in the
+  unit of the width itself, seconds for `fraser_suzuki` and `gaussian` and the
+  dimensionless log-time width for `lognormal`; a `None` entry falls back to the
+  global `width_bounds`.
+
+  `sample_specs` selects which files are fitted and gives each one its own
+  settings, keyed by `sample_short`, as either a `DeconvolutionConstraints` or a
+  dict of arguments. Anything a sample does not state falls back
+  to the arguments of the call. A name matching no sample raises, as does an
+  unknown setting name. A per-component list given at call level is dropped with
+  a warning for a sample that asks for a different `n_peaks`, since its length
+  no longer fits.
+
+  ```python
+  deconv = m.get_constrained_deconvolution(
+      processparams,
+      target_col="normalized_heat_flow_w_g_baseline_corrected",
+      sample_specs={
+          "sample_a": {"n_peaks": 4, "area_fraction_bounds": [...]},
+          "sample_b": {"n_peaks": 3},
+      },
+  )
+  ```
+
+  The default peak shape is the Fraser-Suzuki function, whose width and
+  asymmetry are separate parameters, alongside `lognormal` and `gaussian`.
+  `shared_asymmetry` fits one asymmetry for all components, which stabilises
+  the weak ones where the descending flank carries little structure. The fit is
+  run from several starting points; `optimum_hit_fraction` reports the share of
+  converged starts that reached the reported optimum again and is the check for
+  whether the boundary conditions determine a unique solution.
+
+  ```python
+  m.get_baseline_corrected_data(processparams, inplace=True)
+  deconv = m.get_constrained_deconvolution(
+      processparams,
+      target_col="normalized_heat_flow_w_g_baseline_corrected",
+      n_peaks=3,
+      peak_time_bounds=[(6 * 3600, 18 * 3600), (12 * 3600, 30 * 3600), (25 * 3600, 60 * 3600)],
+      area_fraction_bounds=[(0.55, 0.90), (0.05, 0.30), (0.02, 0.20)],
+  )
+  ```
+
 ## [0.3.4] - 2026-05-28
 
 ### Added

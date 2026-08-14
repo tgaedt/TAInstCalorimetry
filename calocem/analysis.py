@@ -127,6 +127,12 @@ class DeconvolutionAnalyzer:
         if shape == "gaussian":
             return self._gaussian_peak(x, amplitude, center, width)
 
+        if shape == "fraser_suzuki":
+            asymmetry = float(component_row.get("asymmetry", 0.0) or 0.0)
+            return amplitude * ConstrainedDeconvolutionAnalyzer._shape_fraser_suzuki(
+                x, center, width, asymmetry
+            )
+
         x_logn = np.clip(x, 1e-12, None)
         return self._lognormal_peak(x_logn, amplitude, center, width)
 
@@ -1125,6 +1131,823 @@ class DormantPeriodAnalyzer:
         available_cols = [col for col in cols_to_select if col in dormant_hf.columns]
         reduced_df = dormant_hf[available_cols].rename(columns=rename_map)
         return reduced_df
+
+
+class ConstrainedDeconvolutionAnalyzer:
+    """Peak deconvolution with boundary conditions on areas and peak positions.
+
+    Each component is parameterised by the heat it contributes within the fit
+    window rather than by its amplitude. Constraints on area ratios and on the
+    total heat are then linear in the parameters and can be imposed exactly,
+    which is not possible in :class:`DeconvolutionAnalyzer`, where the
+    corresponding option bounds amplitude ratios instead. Peak positions are
+    bounded individually, so approximate timings can be prescribed without
+    fixing them.
+
+    The default shape is the Fraser-Suzuki function, in which width and
+    asymmetry are separate parameters. Where the descending flank carries
+    little information, the asymmetry of the weak components is determined by
+    almost nothing; ``shared_asymmetry`` ties all components to one value,
+    which is the main lever for trading flexibility against stability.
+    """
+
+    SHAPES = ("fraser_suzuki", "lognormal", "gaussian")
+
+    #: settings holding one entry per component
+    PER_COMPONENT_BOUNDS = (
+        "peak_time_bounds",
+        "peak_time_delta_bounds",
+        "area_fraction_bounds",
+        "peak_width_bounds",
+    )
+
+    def __init__(self, processparams: ProcessingParameters):
+        self.processparams = processparams
+
+    @staticmethod
+    def _shape_fraser_suzuki(
+        x: np.ndarray, position: float, width: float, asymmetry: float
+    ) -> np.ndarray:
+        """Fraser-Suzuki peak, normalised to unit height at ``position``."""
+        width = max(width, 1e-9)
+        if abs(asymmetry) < 1e-6:
+            return np.exp(-4.0 * np.log(2.0) * ((x - position) / width) ** 2)
+
+        argument = 1.0 + 2.0 * asymmetry * (x - position) / width
+        shape = np.zeros_like(x, dtype=float)
+        supported = argument > 1e-12
+        shape[supported] = np.exp(
+            -np.log(2.0) / asymmetry**2 * np.log(argument[supported]) ** 2
+        )
+        return shape
+
+    @staticmethod
+    def _shape_lognormal(
+        x: np.ndarray, position: float, width: float, asymmetry: float
+    ) -> np.ndarray:
+        """Gaussian in log time, normalised to unit height at ``position``."""
+        x_safe = np.clip(x, 1e-12, None)
+        return np.exp(
+            -0.5
+            * ((np.log(x_safe) - np.log(max(position, 1e-12))) / max(width, 1e-9)) ** 2
+        )
+
+    @staticmethod
+    def _shape_gaussian(
+        x: np.ndarray, position: float, width: float, asymmetry: float
+    ) -> np.ndarray:
+        return np.exp(-0.5 * ((x - position) / max(width, 1e-9)) ** 2)
+
+    @classmethod
+    def _shape_function(cls, peak_shape: str):
+        return {
+            "fraser_suzuki": cls._shape_fraser_suzuki,
+            "lognormal": cls._shape_lognormal,
+            "gaussian": cls._shape_gaussian,
+        }[peak_shape]
+
+    def get_constrained_deconvolution(
+        self,
+        data: pd.DataFrame,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        n_peaks: int = 3,
+        peak_shape: str = "fraser_suzuki",
+        peak_time_bounds: Optional[list[Optional[tuple[float, float]]]] = None,
+        peak_time_delta_bounds: Optional[list[Optional[tuple[float, float]]]] = None,
+        reference_component: int = 1,
+        area_fraction_bounds: Optional[list[tuple[float, float]]] = None,
+        peak_width_bounds: Optional[list[Optional[tuple[float, float]]]] = None,
+        total_heat_bounds: Optional[tuple[float, float]] = None,
+        asymmetry_bounds: tuple[float, float] = (0.05, 3.0),
+        width_bounds: tuple[float, float] = (0.01, 2.0),
+        shared_asymmetry: bool = True,
+        weighting: str = "none",
+        n_starts: int = 12,
+        seed: int = 0,
+        sample_specs: Optional[dict[str, dict]] = None,
+    ) -> pd.DataFrame:
+        """Fit ``n_peaks`` components under area and timing boundary conditions.
+
+        When ``sample_specs`` is given, only the samples it names are fitted and
+        each one uses the settings it carries, falling back to the arguments of
+        this call for everything it does not name.
+        """
+        try:
+            from scipy.optimize import minimize
+
+            defaults = {
+                "n_peaks": n_peaks,
+                "peak_shape": peak_shape,
+                "peak_time_bounds": peak_time_bounds,
+                "peak_time_delta_bounds": peak_time_delta_bounds,
+                "reference_component": reference_component,
+                "area_fraction_bounds": area_fraction_bounds,
+                "peak_width_bounds": peak_width_bounds,
+                "total_heat_bounds": total_heat_bounds,
+                "asymmetry_bounds": asymmetry_bounds,
+                "width_bounds": width_bounds,
+                "shared_asymmetry": shared_asymmetry,
+                "weighting": weighting,
+                "n_starts": n_starts,
+            }
+            self._validate_sample_specs(sample_specs, defaults)
+
+            rng = np.random.default_rng(seed)
+            all_rows = []
+            fitted_samples = set()
+
+            for sample, sample_data in SampleIterator.iter_samples(data, regex):
+                sample_short = pathlib.Path(str(sample)).stem
+
+                if sample_specs is not None:
+                    if sample_short not in sample_specs:
+                        continue
+                    overrides = sample_specs[sample_short]
+                    config = self._drop_inherited_bounds(
+                        {**defaults, **overrides}, overrides, sample_short
+                    )
+                else:
+                    config = defaults
+                fitted_samples.add(sample_short)
+
+                config = self._resolve_config(config)
+                shape_fn = self._shape_function(config["peak_shape"])
+                fits_asymmetry = config["peak_shape"] == "fraser_suzuki"
+
+                working = (
+                    sample_data[[age_col, target_col]]
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                    .sort_values(age_col)
+                )
+                if self.processparams.cutoff.cutoff_min:
+                    working = working[
+                        working[age_col] >= self.processparams.cutoff.cutoff_min * 60
+                    ]
+
+                if len(working) < self.processparams.deconvolution.min_points:
+                    logger.warning(
+                        f"Skipping constrained deconvolution for {sample_short}: "
+                        "not enough points"
+                    )
+                    continue
+
+                x_raw = working[age_col].to_numpy(dtype=float)
+                y_raw = working[target_col].to_numpy(dtype=float)
+                if np.nanmax(y_raw) <= 0:
+                    logger.warning(
+                        f"Skipping constrained deconvolution for {sample_short}: "
+                        "non-positive signal"
+                    )
+                    continue
+
+                fit_result = self._fit_sample(
+                    x_raw,
+                    y_raw,
+                    minimize=minimize,
+                    shape_fn=shape_fn,
+                    fits_asymmetry=fits_asymmetry,
+                    n_peaks=config["n_peaks"],
+                    peak_time_bounds=config["peak_time_bounds"],
+                    peak_time_delta_bounds=config["peak_time_delta_bounds"],
+                    reference_component=config["reference_component"],
+                    area_fraction_bounds=config["area_fraction_bounds"],
+                    peak_width_bounds=config["peak_width_bounds"],
+                    total_heat_bounds=config["total_heat_bounds"],
+                    asymmetry_bounds=config["asymmetry_bounds"],
+                    width_bounds=config["width_bounds"],
+                    shared_asymmetry=config["shared_asymmetry"],
+                    weighting=config["weighting"],
+                    n_starts=config["n_starts"],
+                    rng=rng,
+                )
+
+                if fit_result is None:
+                    logger.warning(
+                        f"Constrained deconvolution failed for {sample_short}"
+                    )
+                    continue
+
+                for row in fit_result:
+                    row["sample"] = sample
+                    row["sample_short"] = sample_short
+                    row["peak_shape"] = config["peak_shape"]
+                    row["n_peaks_fitted"] = config["n_peaks"]
+                all_rows.extend(fit_result)
+
+            if sample_specs is not None:
+                unmatched = sorted(set(sample_specs) - fitted_samples)
+                if unmatched:
+                    raise ValueError(
+                        "sample_specs names samples that are not in the "
+                        f"measurement (or are excluded by regex): {unmatched}"
+                    )
+
+            return pd.DataFrame(all_rows)
+
+        except Exception as e:
+            raise DataProcessingException("get_constrained_deconvolution", e)
+
+    @staticmethod
+    def _validate_sample_specs(sample_specs, defaults):
+        """Reject malformed per-sample specifications before any fitting."""
+        if sample_specs is None:
+            return
+        if not isinstance(sample_specs, dict):
+            raise ValueError("sample_specs must be a dict keyed by sample_short")
+
+        for sample_short, overrides in sample_specs.items():
+            if not isinstance(overrides, dict):
+                raise ValueError(
+                    f"sample_specs['{sample_short}'] must be a dict of settings"
+                )
+            unknown = sorted(set(overrides) - set(defaults))
+            if unknown:
+                raise ValueError(
+                    f"sample_specs['{sample_short}'] contains unknown settings "
+                    f"{unknown}; allowed are {sorted(defaults)}"
+                )
+
+    @classmethod
+    def _drop_inherited_bounds(cls, config, overrides, sample_short):
+        """Discard per-component lists that a changed ``n_peaks`` invalidates.
+
+        A sample that asks for a different number of components cannot use the
+        lists given at call level, since they have one entry per component of
+        the common setting. Lists the sample states itself are kept and are
+        checked for length like any other.
+        """
+        for key in cls.PER_COMPONENT_BOUNDS:
+            if key in overrides:
+                continue
+            value = config.get(key)
+            if value is not None and len(value) != config["n_peaks"]:
+                logger.warning(
+                    f"{sample_short}: dropping the inherited {key} because this "
+                    f"sample is fitted with {config['n_peaks']} components "
+                    f"instead of {len(value)}; state it in its sample_specs "
+                    "entry to keep it"
+                )
+                config[key] = None
+        return config
+
+    def _resolve_config(self, config: dict) -> dict:
+        """Normalise one sample's settings and validate them against each other."""
+        config = dict(config)
+        config["peak_shape"] = (config["peak_shape"] or "fraser_suzuki").lower()
+
+        if config["peak_shape"] not in self.SHAPES:
+            raise ValueError(f"peak_shape must be one of {self.SHAPES}")
+        if config["weighting"] not in {"none", "inverse"}:
+            raise ValueError("weighting must be 'none' or 'inverse'")
+        if config["n_peaks"] < 1:
+            raise ValueError("n_peaks must be >= 1")
+
+        self._validate_bounds(
+            config["n_peaks"],
+            config["peak_time_bounds"],
+            config["peak_time_delta_bounds"],
+            config["reference_component"],
+            config["area_fraction_bounds"],
+            config["peak_width_bounds"],
+            config["total_heat_bounds"],
+        )
+        return config
+
+    @staticmethod
+    def _validate_bounds(
+        n_peaks,
+        peak_time_bounds,
+        peak_time_delta_bounds,
+        reference_component,
+        area_fraction_bounds,
+        peak_width_bounds,
+        total_heat_bounds,
+    ):
+        """Reject boundary conditions that cannot be satisfied."""
+        if peak_time_bounds is not None:
+            if len(peak_time_bounds) != n_peaks:
+                raise ValueError("peak_time_bounds must have length n_peaks")
+            for entry in peak_time_bounds:
+                if entry is not None and not entry[1] > entry[0]:
+                    raise ValueError("each peak_time_bounds entry must have hi > lo")
+
+        if peak_time_delta_bounds is not None:
+            if not 1 <= reference_component <= n_peaks:
+                raise ValueError("reference_component must be between 1 and n_peaks")
+            if len(peak_time_delta_bounds) != n_peaks:
+                raise ValueError("peak_time_delta_bounds must have length n_peaks")
+
+            reference_index = reference_component - 1
+            if peak_time_delta_bounds[reference_index] is not None:
+                raise ValueError(
+                    "the reference component cannot have a delta bound to itself"
+                )
+            for index, entry in enumerate(peak_time_delta_bounds):
+                if entry is None:
+                    continue
+                low, high = entry
+                if not high > low:
+                    raise ValueError(
+                        "each peak_time_delta_bounds entry must have hi > lo"
+                    )
+                # Components are ordered in time, so a component listed after the
+                # reference has to be able to sit after it, and one listed before
+                # it has to be able to sit before it.
+                if index > reference_index and high <= 0:
+                    raise ValueError(
+                        f"component {index + 1} follows the reference component, "
+                        "so its upper delta must be positive"
+                    )
+                if index < reference_index and low >= 0:
+                    raise ValueError(
+                        f"component {index + 1} precedes the reference component, "
+                        "so its lower delta must be negative"
+                    )
+
+        if peak_width_bounds is not None:
+            if len(peak_width_bounds) != n_peaks:
+                raise ValueError("peak_width_bounds must have length n_peaks")
+            for entry in peak_width_bounds:
+                if entry is None:
+                    continue
+                low, high = entry
+                if not 0.0 < low < high:
+                    raise ValueError(
+                        "each peak_width_bounds entry must satisfy 0 < lo < hi"
+                    )
+
+        if area_fraction_bounds is not None:
+            if len(area_fraction_bounds) != n_peaks:
+                raise ValueError("area_fraction_bounds must have length n_peaks")
+            for low, high in area_fraction_bounds:
+                if not 0.0 <= low <= high <= 1.0:
+                    raise ValueError(
+                        "each area_fraction_bounds entry must satisfy 0 <= lo <= hi <= 1"
+                    )
+            if sum(high for _, high in area_fraction_bounds) < 1.0:
+                raise ValueError("area_fraction_bounds upper limits must sum to >= 1")
+            if sum(low for low, _ in area_fraction_bounds) > 1.0:
+                raise ValueError("area_fraction_bounds lower limits must sum to <= 1")
+
+        if total_heat_bounds is not None:
+            low, high = total_heat_bounds
+            if not 0.0 <= low < high:
+                raise ValueError("total_heat_bounds must satisfy 0 <= lo < hi")
+
+    def _fit_sample(
+        self,
+        x_raw,
+        y_raw,
+        *,
+        minimize,
+        shape_fn,
+        fits_asymmetry,
+        n_peaks,
+        peak_time_bounds,
+        peak_time_delta_bounds,
+        reference_component,
+        area_fraction_bounds,
+        peak_width_bounds,
+        total_heat_bounds,
+        asymmetry_bounds,
+        width_bounds,
+        shared_asymmetry,
+        weighting,
+        n_starts,
+        rng,
+    ):
+        """Fit one sample from several starting points and return the best result."""
+        params = self.processparams.deconvolution
+        width_is_time = shape_fn is not self._shape_lognormal
+
+        # Scale to order unity. The raw problem mixes seconds with W/g, which
+        # spreads the parameters over about ten orders of magnitude and makes
+        # the optimiser's convergence criteria meaningless.
+        t_scale = float(np.nanmax(x_raw))
+        y_scale = float(np.nanmax(y_raw))
+        x = x_raw / t_scale
+        y = y_raw / y_scale
+        heat_scale = t_scale * y_scale
+
+        x_opt, y_opt = x, y
+        if params.max_fit_points and len(x) > params.max_fit_points:
+            index = np.linspace(0, len(x) - 1, params.max_fit_points).astype(int)
+            x_opt, y_opt = x[index], y[index]
+
+        if weighting == "inverse":
+            weights = 1.0 / (np.abs(y_opt) + 0.05 * float(np.nanmax(np.abs(y_opt))))
+            weights = weights / float(np.mean(weights))
+        else:
+            weights = np.ones_like(y_opt)
+
+        measured_heat = float(np.trapezoid(y_opt, x_opt))
+        n_asymmetry = (1 if shared_asymmetry else n_peaks) if fits_asymmetry else 0
+
+        def unpack(theta):
+            heats = theta[:n_peaks]
+            positions = theta[n_peaks : 2 * n_peaks]
+            widths = theta[2 * n_peaks : 3 * n_peaks]
+            if n_asymmetry == 0:
+                asymmetries = np.zeros(n_peaks)
+            elif shared_asymmetry:
+                asymmetries = np.full(n_peaks, theta[3 * n_peaks])
+            else:
+                asymmetries = theta[3 * n_peaks : 4 * n_peaks]
+            return heats, positions, widths, asymmetries
+
+        def components(theta, x_eval):
+            """Component curves, each carrying exactly its heat parameter."""
+            heats, positions, widths, asymmetries = unpack(theta)
+            curves = []
+            for i in range(n_peaks):
+                shape = shape_fn(x_eval, positions[i], widths[i], asymmetries[i])
+                # Normalise over the fit window, so that the heat parameter is
+                # the area actually contributed inside the measurement and not
+                # an extrapolated integral over an infinite tail.
+                area = float(np.trapezoid(shape, x_eval))
+                curves.append(heats[i] * shape / max(area, 1e-12))
+            return curves
+
+        def objective(theta):
+            model = np.sum(components(theta, x_opt), axis=0)
+            residual = (y_opt - model) * weights
+            return float(np.dot(residual, residual))
+
+        lower, upper = self._parameter_bounds(
+            n_peaks=n_peaks,
+            n_asymmetry=n_asymmetry,
+            x=x,
+            measured_heat=measured_heat,
+            peak_time_bounds=peak_time_bounds,
+            peak_width_bounds=peak_width_bounds,
+            width_is_time=width_is_time,
+            t_scale=t_scale,
+            heat_scale=heat_scale,
+            total_heat_bounds=total_heat_bounds,
+            width_bounds=width_bounds,
+            asymmetry_bounds=asymmetry_bounds,
+        )
+
+        # Delta bounds are expressed in the same time unit as the data and have
+        # to be scaled along with the positions they constrain.
+        scaled_delta_bounds = (
+            None
+            if peak_time_delta_bounds is None
+            else [
+                None if entry is None else (entry[0] / t_scale, entry[1] / t_scale)
+                for entry in peak_time_delta_bounds
+            ]
+        )
+        reference_index = reference_component - 1
+
+        constraints = self._build_constraints(
+            n_peaks=n_peaks,
+            x=x,
+            peak_time_delta_bounds=scaled_delta_bounds,
+            reference_index=reference_index,
+            area_fraction_bounds=area_fraction_bounds,
+            total_heat_bounds=total_heat_bounds,
+            heat_scale=heat_scale,
+            min_separation=max(
+                params.min_peak_time_separation_fraction
+                * float(x.max() - x.min()),
+                1e-9,
+            ),
+        )
+
+        best = None
+        objectives = []
+        for start in range(max(1, n_starts)):
+            theta0 = self._initial_guess(
+                start=start,
+                rng=rng,
+                n_peaks=n_peaks,
+                n_asymmetry=n_asymmetry,
+                lower=lower,
+                upper=upper,
+                measured_heat=measured_heat,
+                area_fraction_bounds=area_fraction_bounds,
+                peak_time_delta_bounds=scaled_delta_bounds,
+                reference_index=reference_index,
+                total_heat_bounds=(
+                    None
+                    if total_heat_bounds is None
+                    else tuple(bound / heat_scale for bound in total_heat_bounds)
+                ),
+            )
+            try:
+                result = minimize(
+                    objective,
+                    x0=theta0,
+                    method="SLSQP",
+                    bounds=list(zip(lower, upper)),
+                    constraints=constraints,
+                    options={"maxiter": int(params.max_nfev), "ftol": 1e-12},
+                )
+            except Exception:
+                continue
+
+            if not result.success:
+                continue
+            objectives.append(float(result.fun))
+            if best is None or result.fun < best.fun:
+                best = result
+
+        if best is None:
+            return None
+
+        return self._compile_rows(
+            best=best,
+            objectives=objectives,
+            components=components,
+            unpack=unpack,
+            x=x,
+            y=y,
+            n_peaks=n_peaks,
+            t_scale=t_scale,
+            y_scale=y_scale,
+            heat_scale=heat_scale,
+            width_is_time=width_is_time,
+            reference_index=reference_index,
+        )
+
+    @staticmethod
+    def _parameter_bounds(
+        *,
+        n_peaks,
+        n_asymmetry,
+        x,
+        measured_heat,
+        peak_time_bounds,
+        peak_width_bounds,
+        width_is_time,
+        t_scale,
+        heat_scale,
+        total_heat_bounds,
+        width_bounds,
+        asymmetry_bounds,
+    ):
+        heat_ceiling = max(abs(measured_heat) * 5.0, 1e-9)
+        if total_heat_bounds is not None:
+            heat_ceiling = max(heat_ceiling, total_heat_bounds[1] / heat_scale)
+
+        lower = [0.0] * n_peaks
+        upper = [heat_ceiling] * n_peaks
+
+        x_min, x_max = float(x.min()), float(x.max())
+        for i in range(n_peaks):
+            entry = None if peak_time_bounds is None else peak_time_bounds[i]
+            if entry is None:
+                lower.append(x_min)
+                upper.append(x_max)
+            else:
+                lower.append(max(entry[0] / t_scale, x_min))
+                upper.append(min(entry[1] / t_scale, x_max))
+
+        # Per-component width bounds are given in the unit of the width itself:
+        # a time for the Fraser-Suzuki and Gaussian shapes, and the dimensionless
+        # log-time width of the lognormal shape. Only the former is affected by
+        # the scaling of the time axis.
+        width_factor = t_scale if width_is_time else 1.0
+        for i in range(n_peaks):
+            entry = None if peak_width_bounds is None else peak_width_bounds[i]
+            if entry is None:
+                lower.append(width_bounds[0])
+                upper.append(width_bounds[1])
+            else:
+                lower.append(entry[0] / width_factor)
+                upper.append(entry[1] / width_factor)
+
+        lower.extend([asymmetry_bounds[0]] * n_asymmetry)
+        upper.extend([asymmetry_bounds[1]] * n_asymmetry)
+
+        return lower, upper
+
+    @staticmethod
+    def _build_constraints(
+        *, n_peaks, x, peak_time_delta_bounds, reference_index,
+        area_fraction_bounds, total_heat_bounds, heat_scale, min_separation
+    ):
+        """Linear inequality constraints on heats and peak positions."""
+        constraints = []
+
+        for i in range(n_peaks - 1):
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda theta, i=i: (
+                        theta[n_peaks + i + 1] - theta[n_peaks + i] - min_separation
+                    ),
+                }
+            )
+
+        if peak_time_delta_bounds is not None:
+            for i, entry in enumerate(peak_time_delta_bounds):
+                if entry is None or i == reference_index:
+                    continue
+                low, high = entry
+                constraints.append(
+                    {
+                        "type": "ineq",
+                        "fun": lambda theta, i=i, low=low: (
+                            theta[n_peaks + i]
+                            - theta[n_peaks + reference_index]
+                            - low
+                        ),
+                    }
+                )
+                constraints.append(
+                    {
+                        "type": "ineq",
+                        "fun": lambda theta, i=i, high=high: (
+                            high
+                            - theta[n_peaks + i]
+                            + theta[n_peaks + reference_index]
+                        ),
+                    }
+                )
+
+        if area_fraction_bounds is not None:
+            for i, (low, high) in enumerate(area_fraction_bounds):
+                if low > 0.0:
+                    constraints.append(
+                        {
+                            "type": "ineq",
+                            "fun": lambda theta, i=i, low=low: (
+                                theta[i] - low * float(np.sum(theta[:n_peaks]))
+                            ),
+                        }
+                    )
+                if high < 1.0:
+                    constraints.append(
+                        {
+                            "type": "ineq",
+                            "fun": lambda theta, i=i, high=high: (
+                                high * float(np.sum(theta[:n_peaks])) - theta[i]
+                            ),
+                        }
+                    )
+
+        if total_heat_bounds is not None:
+            low, high = (bound / heat_scale for bound in total_heat_bounds)
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda theta, low=low: float(np.sum(theta[:n_peaks])) - low,
+                }
+            )
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda theta, high=high: high - float(np.sum(theta[:n_peaks])),
+                }
+            )
+
+        return constraints
+
+    @staticmethod
+    def _initial_guess(
+        *, start, rng, n_peaks, n_asymmetry, lower, upper, measured_heat,
+        area_fraction_bounds, peak_time_delta_bounds, reference_index,
+        total_heat_bounds
+    ):
+        """Deterministic guess for the first start, jittered ones afterwards.
+
+        The guess is placed inside the area, delta and total-heat constraints.
+        Starting outside them leaves SLSQP no feasible descent direction, and
+        every start fails rather than the constraint simply biting.
+        """
+        lower = np.asarray(lower, dtype=float)
+        upper = np.asarray(upper, dtype=float)
+
+        if area_fraction_bounds is None:
+            fractions = np.full(n_peaks, 1.0 / n_peaks)
+        else:
+            fractions = np.array(
+                [(low + high) / 2 for low, high in area_fraction_bounds]
+            )
+            fractions = fractions / max(float(np.sum(fractions)), 1e-12)
+
+        total_heat = abs(measured_heat)
+        if total_heat_bounds is not None:
+            total_heat = float(
+                np.clip(total_heat, total_heat_bounds[0], total_heat_bounds[1])
+            )
+        heats = total_heat * fractions
+
+        positions = lower[n_peaks : 2 * n_peaks] + 0.5 * (
+            upper[n_peaks : 2 * n_peaks] - lower[n_peaks : 2 * n_peaks]
+        )
+        widths = np.sqrt(
+            lower[2 * n_peaks : 3 * n_peaks] * upper[2 * n_peaks : 3 * n_peaks]
+        )
+        asymmetries = 0.5 * (lower[3 * n_peaks :] + upper[3 * n_peaks :])
+
+        if start > 0:
+            # The heats are jittered as fractions and renormalised, so that the
+            # total stays where it was placed. Jittering them on their own
+            # bounds would immediately violate the total-heat constraint, whose
+            # upper limit is deliberately generous.
+            fractions = np.abs(fractions + rng.uniform(-0.15, 0.15, size=n_peaks))
+            heats = total_heat * fractions / max(float(np.sum(fractions)), 1e-12)
+
+            shape_slice = slice(n_peaks, len(lower))
+            span = (upper - lower)[shape_slice]
+            jitter = rng.uniform(-0.3, 0.3, size=span.shape) * span
+            positions, widths, asymmetries = np.split(
+                np.concatenate([positions, widths, asymmetries]) + jitter,
+                [n_peaks, 2 * n_peaks],
+            )
+            # keep the positions ordered, otherwise the separation constraint
+            # rejects the start before the optimiser sees it
+            positions = np.sort(positions)
+
+        if peak_time_delta_bounds is not None:
+            # Place the constrained components relative to the reference rather
+            # than on their own bounds, so that the start satisfies the delta
+            # constraints. The offsets are drawn from within their interval for
+            # the jittered starts and taken at its midpoint for the first one.
+            positions = np.clip(
+                positions,
+                lower[n_peaks : 2 * n_peaks],
+                upper[n_peaks : 2 * n_peaks],
+            )
+            for i, entry in enumerate(peak_time_delta_bounds):
+                if entry is None or i == reference_index:
+                    continue
+                low, high = entry
+                offset = rng.uniform(low, high) if start > 0 else (low + high) / 2
+                positions[i] = positions[reference_index] + offset
+
+        theta = np.concatenate([heats, positions, widths, asymmetries])
+        return np.clip(theta, lower, upper)
+
+    @staticmethod
+    def _compile_rows(
+        *, best, objectives, components, unpack, x, y, n_peaks, t_scale, y_scale,
+        heat_scale, width_is_time, reference_index
+    ):
+        theta = np.asarray(best.x, dtype=float)
+        curves = components(theta, x)
+        model = np.sum(curves, axis=0)
+
+        residual = y - model
+        ss_res = float(np.sum(residual**2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        fit_r2 = np.nan if ss_tot == 0 else 1 - ss_res / ss_tot
+        fit_rmse = float(np.sqrt(np.mean(residual**2))) * y_scale
+
+        heats, positions, widths, asymmetries = unpack(theta)
+        total_heat = float(np.sum(heats))
+
+        # How often the best optimum was reached again from an independent
+        # start. A value well below one means the objective has several distinct
+        # minima under the given boundary conditions and the reported split is
+        # one of them rather than the solution.
+        best_objective = float(best.fun)
+        if objectives and best_objective > 0:
+            at_optimum = sum(1 for v in objectives if v <= best_objective * 1.01)
+            optimum_hit_fraction = at_optimum / len(objectives)
+        else:
+            optimum_hit_fraction = np.nan
+
+        # The width of a Fraser-Suzuki or Gaussian component is a time, so it has
+        # to be reported in the original units for the curve to be reproducible
+        # from the result frame. The lognormal width lives in log time and is
+        # invariant under the scaling.
+        width_factor = t_scale if width_is_time else 1.0
+
+        reference_position = float(positions[reference_index])
+
+        rows = []
+        for i in range(n_peaks):
+            curve = curves[i]
+            rows.append(
+                {
+                    "component": i + 1,
+                    "amplitude": float(np.max(curve)) * y_scale,
+                    "center_time_s": float(positions[i]) * t_scale,
+                    "peak_time_delta_s": (
+                        float(positions[i]) - reference_position
+                    ) * t_scale,
+                    "peak_time_s": float(x[int(np.argmax(curve))]) * t_scale,
+                    "width": float(widths[i]) * width_factor,
+                    "asymmetry": float(asymmetries[i]),
+                    "component_area": float(heats[i]) * heat_scale,
+                    "component_area_fraction": (
+                        float(heats[i] / total_heat) if total_heat > 0 else np.nan
+                    ),
+                    "total_area": total_heat * heat_scale,
+                    "fit_r2": fit_r2,
+                    "fit_rmse": fit_rmse,
+                    "n_starts_converged": len(objectives),
+                    "optimum_hit_fraction": optimum_hit_fraction,
+                }
+            )
+        return rows
 
 
 class BaselineAnalyzer:
