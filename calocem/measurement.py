@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from .analysis import (
     ASTMC1679Analyzer,
     AverageSlopeAnalyzer,
+    BaselineAnalyzer,
     DeconvolutionAnalyzer,
     DormantPeriodAnalyzer,
     FirstAscendingSlopeAnalyzer,
@@ -1839,6 +1840,133 @@ class Measurement:
             return dorm_hf
         else:
             return pd.DataFrame()
+
+    def get_baseline(
+        self,
+        processparams: Optional[ProcessingParameters] = None,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        anchor_start_s: Optional[float] = None,
+        anchor_end_s: Optional[float] = None,
+        show_plot: bool = False,
+        ax=None,
+        xunit: str = "h",
+    ) -> pd.DataFrame:
+        """Fit a simple linear baseline to the heat-flow curve of each sample.
+
+        The baseline is the straight line through two anchor points. Unless
+        given explicitly, the first anchor is placed at the heat-flow minimum
+        of the dormant period and the second at the last point of the curve.
+        The heat flow at an anchor is averaged over
+        ``processparams.baseline.window_s`` to suppress noise.
+
+        The measurement data are not modified; use
+        :meth:`get_baseline_corrected_data` to obtain the corrected curve.
+
+        Parameters
+        ----------
+        processparams : ProcessingParameters, optional
+            Processing parameters, by default the measurement's parameters.
+        target_col, age_col : str
+            Heat flow and time columns.
+        regex : str, optional
+            Regex to filter samples.
+        anchor_start_s, anchor_end_s : float, optional
+            Anchor times in seconds. If None, the values from
+            ``processparams.baseline`` are used, which default to automatic
+            placement.
+        show_plot : bool
+            Whether to draw the curves together with their baseline and anchors.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If None, a new figure is created.
+        xunit : str
+            Time unit of the x-axis of the plot ('s', 'min', 'h' or 'd').
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per sample with the baseline slope and intercept
+            (``baseline_slope_w_g_s``, ``baseline_intercept_w_g``) and the
+            position of both anchor points.
+        """
+        params = processparams or self.processparams
+
+        analyzer = BaselineAnalyzer(params)
+        baseline = analyzer.get_baseline(
+            self._data,
+            target_col=target_col,
+            age_col=age_col,
+            regex=regex,
+            anchor_start_s=anchor_start_s,
+            anchor_end_s=anchor_end_s,
+        )
+
+        if show_plot and not baseline.empty:
+            self._plotter.plot_baseline(
+                self._data,
+                baseline,
+                ax=ax,
+                age_col=age_col,
+                target_col=target_col,
+                xunit=xunit,
+                show_corrected=True,
+                cutoff_time_min=params.cutoff.cutoff_min,
+            )
+
+        return baseline
+
+    def get_baseline_corrected_data(
+        self,
+        processparams: Optional[ProcessingParameters] = None,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        anchor_start_s: Optional[float] = None,
+        anchor_end_s: Optional[float] = None,
+        corrected_col: Optional[str] = None,
+        inplace: bool = False,
+    ) -> pd.DataFrame:
+        """Return a copy of the data with a baseline-corrected heat-flow column.
+
+        The baseline is determined by :meth:`get_baseline` and subtracted from
+        ``target_col``. The result is written to ``corrected_col``, which
+        defaults to ``<target_col>_baseline_corrected``.
+
+        With ``inplace=True`` the column is additionally attached to the
+        measurement, so that subsequent analyses can use it by passing
+        ``target_col=corrected_col``. This only adds a column; ``target_col``
+        itself is never overwritten.
+        """
+        params = processparams or self.processparams
+
+        analyzer = BaselineAnalyzer(params)
+        baseline = analyzer.get_baseline(
+            self._data,
+            target_col=target_col,
+            age_col=age_col,
+            regex=regex,
+            anchor_start_s=anchor_start_s,
+            anchor_end_s=anchor_end_s,
+        )
+
+        if baseline.empty:
+            logger.warning("No baseline determined; returning unmodified data.")
+            return self._data.copy()
+
+        corrected = analyzer.subtract_baseline(
+            self._data,
+            baseline,
+            target_col=target_col,
+            age_col=age_col,
+            corrected_col=corrected_col,
+        )
+
+        if inplace:
+            corrected_col = corrected_col or f"{target_col}_baseline_corrected"
+            self._data[corrected_col] = corrected[corrected_col]
+
+        return corrected
 
     def get_astm_c1679_characteristics(
         self,

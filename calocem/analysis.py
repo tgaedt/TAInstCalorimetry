@@ -1127,6 +1127,167 @@ class DormantPeriodAnalyzer:
         return reduced_df
 
 
+class BaselineAnalyzer:
+    """Fits a simple linear baseline to the heat-flow curve.
+
+    The baseline is the straight line through two anchor points. By default the
+    first anchor is the heat-flow minimum of the dormant period and the second
+    the last point of the curve, which is the usual construction for separating
+    the hydration peaks from the slowly decaying background. Both anchors can
+    be placed explicitly if the automatic choice is not appropriate.
+    """
+
+    def __init__(self, processparams: ProcessingParameters):
+        self.processparams = processparams
+
+    def get_baseline(
+        self,
+        data: pd.DataFrame,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        regex: Optional[str] = None,
+        anchor_start_s: Optional[float] = None,
+        anchor_end_s: Optional[float] = None,
+    ) -> pd.DataFrame:
+        """Return one row per sample describing the fitted linear baseline."""
+        try:
+            params = self.processparams.baseline
+            if anchor_start_s is None:
+                anchor_start_s = params.anchor_start_s
+            if anchor_end_s is None:
+                anchor_end_s = params.anchor_end_s
+
+            rows = []
+
+            for sample, sample_data in SampleIterator.iter_samples(data, regex):
+                sample_short = pathlib.Path(str(sample)).stem
+                working = self._prepare_data(sample_data, target_col, age_col)
+
+                if len(working) < 2:
+                    logger.warning(
+                        f"Skipping baseline for {sample_short}: not enough points"
+                    )
+                    continue
+
+                x = working[age_col].to_numpy(dtype=float)
+                y = working[target_col].to_numpy(dtype=float)
+
+                t_start = (
+                    float(anchor_start_s)
+                    if anchor_start_s is not None
+                    else self._dormant_minimum_time(x, y)
+                )
+                t_end = float(anchor_end_s) if anchor_end_s is not None else float(x[-1])
+
+                if t_end <= t_start:
+                    logger.warning(
+                        f"Skipping baseline for {sample_short}: "
+                        f"end anchor ({t_end} s) is not after start anchor ({t_start} s)"
+                    )
+                    continue
+
+                y_start = self._anchor_value(x, y, t_start, params.window_s)
+                y_end = self._anchor_value(x, y, t_end, params.window_s)
+
+                slope = (y_end - y_start) / (t_end - t_start)
+                intercept = y_start - slope * t_start
+
+                rows.append(
+                    {
+                        "sample": sample,
+                        "sample_short": sample_short,
+                        "baseline_slope_w_g_s": slope,
+                        "baseline_intercept_w_g": intercept,
+                        "anchor_start_s": t_start,
+                        "anchor_start_w_g": y_start,
+                        "anchor_end_s": t_end,
+                        "anchor_end_w_g": y_end,
+                        "anchor_start_auto": anchor_start_s is None,
+                        "anchor_end_auto": anchor_end_s is None,
+                    }
+                )
+
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows)
+
+        except Exception as e:
+            raise DataProcessingException("get_baseline", e)
+
+    def subtract_baseline(
+        self,
+        data: pd.DataFrame,
+        baseline: pd.DataFrame,
+        target_col: str = "normalized_heat_flow_w_g",
+        age_col: str = "time_s",
+        corrected_col: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Return a copy of ``data`` with a baseline-corrected heat-flow column.
+
+        Samples without a baseline row keep their original heat flow and get a
+        NaN in the corrected column, so that they can be identified downstream.
+        """
+        try:
+            if baseline.empty:
+                raise ValueError("No baseline available to subtract")
+
+            corrected_col = corrected_col or f"{target_col}_baseline_corrected"
+            corrected = data.copy()
+            corrected[corrected_col] = np.nan
+
+            for _, row in baseline.iterrows():
+                mask = corrected["sample_short"] == row["sample_short"]
+                corrected.loc[mask, corrected_col] = corrected.loc[
+                    mask, target_col
+                ] - self.evaluate(row, corrected.loc[mask, age_col].to_numpy(dtype=float))
+
+            return corrected
+
+        except Exception as e:
+            raise DataProcessingException("subtract_baseline", e)
+
+    @staticmethod
+    def evaluate(baseline_row: pd.Series, x: np.ndarray) -> np.ndarray:
+        """Evaluate the linear baseline of a single sample at the times ``x``."""
+        return float(baseline_row["baseline_intercept_w_g"]) + float(
+            baseline_row["baseline_slope_w_g_s"]
+        ) * np.asarray(x, dtype=float)
+
+    def _prepare_data(
+        self, sample_data: pd.DataFrame, target_col: str, age_col: str
+    ) -> pd.DataFrame:
+        """Drop invalid rows, apply the cutoff and sort by time."""
+        working = (
+            sample_data[[age_col, target_col]]
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if self.processparams.cutoff.cutoff_min:
+            cutoff_seconds = self.processparams.cutoff.cutoff_min * 60
+            working = working[working[age_col] >= cutoff_seconds]
+        return working.sort_values(age_col).reset_index(drop=True)
+
+    @staticmethod
+    def _dormant_minimum_time(x: np.ndarray, y: np.ndarray) -> float:
+        """Time of the heat-flow minimum preceding the highest peak."""
+        peak_idx = int(np.argmax(y))
+        if peak_idx == 0:
+            return float(x[0])
+        return float(x[int(np.argmin(y[: peak_idx + 1]))])
+
+    @staticmethod
+    def _anchor_value(
+        x: np.ndarray, y: np.ndarray, t: float, window_s: float
+    ) -> float:
+        """Mean heat flow within ``window_s`` centred on ``t``."""
+        if window_s and window_s > 0:
+            half_window = window_s / 2
+            in_window = (x >= t - half_window) & (x <= t + half_window)
+            if in_window.any():
+                return float(np.mean(y[in_window]))
+        return float(y[int(np.argmin(np.abs(x - t)))])
+
+
 class ASTMC1679Analyzer:
     """Analyzes characteristics according to ASTM C1679."""
 

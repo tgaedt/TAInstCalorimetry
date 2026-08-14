@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Measurement.get_baseline()` and `Measurement.get_baseline_corrected_data()`.**
+  A simple linear baseline for the heat-flow curve, fitted as the straight line
+  through two anchor points. By default the first anchor is the heat-flow
+  minimum of the dormant period and the second the last point of the curve; both
+  can be placed explicitly. The heat flow at an anchor is averaged over
+  `ProcessingParameters.baseline.window_s` to suppress noise. `get_baseline`
+  returns slope, intercept and both anchors per sample and leaves the
+  measurement unchanged; `get_baseline_corrected_data` returns a copy of the
+  data with an additional `<target_col>_baseline_corrected` column.
+
+  ```python
+  baseline = m.get_baseline(processparams, show_plot=True)
+  corrected = m.get_baseline_corrected_data(processparams, anchor_start_s=8 * 3600)
+  ```
+
+  With `inplace=True` the corrected column is attached to the measurement, so
+  that it can be used by any analysis accepting `target_col`. In particular it
+  allows the baseline to be fixed before a deconvolution instead of being fitted
+  along with the peaks:
+
+  ```python
+  m.get_baseline_corrected_data(processparams, inplace=True)
+  deconv = m.get_deconvolution(
+      processparams,
+      target_col="normalized_heat_flow_w_g_baseline_corrected",
+      baseline_mode="none",
+  )
+  ```
+
 ## [0.3.4] - 2026-05-28
 
 ### Added

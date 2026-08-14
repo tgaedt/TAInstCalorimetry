@@ -63,6 +63,58 @@ tam.get_peaks(
 )
 plt.show()
 
+# %% simple linear baseline
+#
+# The measured curve sits on a slowly decaying background. get_baseline fits a
+# straight line through two anchor points and returns its slope and intercept
+# per sample. Without further arguments the first anchor is placed at the
+# heat-flow minimum of the dormant period and the second at the last point of
+# the curve; the heat flow at each anchor is averaged over
+# processparams.baseline.window_s to suppress noise.
+
+processparams.baseline.window_s = 1800
+
+baseline = tam.get_baseline(processparams=processparams, show_plot=True, xunit="h")
+plt.show()
+print(baseline.to_string(index=False))
+
+# %% baseline with explicitly placed anchors
+#
+# The automatic placement follows the usual definition of the dormant period,
+# i.e. the heat-flow minimum preceding the highest peak. For this measurement
+# the highest peak is the sharp aluminate peak at about 2.9 h, so the automatic
+# anchor lands at roughly 0.5 h, and the resulting line cuts through the deeper
+# minimum near 8 h. Placing the anchors explicitly is the remedy: the minimum
+# between the aluminate peak and the broad silicate hump is the appropriate
+# start, the last measured point the appropriate end.
+
+baseline_manual = tam.get_baseline(
+    processparams=processparams,
+    anchor_start_s=8 * 3600,
+    show_plot=True,
+    xunit="h",
+)
+plt.show()
+print(baseline_manual.to_string(index=False))
+
+# %% working with the baseline-corrected curve
+#
+# get_baseline_corrected_data returns a copy of the data with an additional
+# column; the measurement itself is left unchanged.
+
+corrected = tam.get_baseline_corrected_data(
+    processparams=processparams, anchor_start_s=8 * 3600
+)
+print(
+    corrected[
+        [
+            "time_s",
+            "normalized_heat_flow_w_g",
+            "normalized_heat_flow_w_g_baseline_corrected",
+        ]
+    ].describe()
+)
+
 # %% minimal per-peak parameters via get_multipeak_params
 #
 # The OPC curve shows several hydration peaks (early, main silicate and the

@@ -255,6 +255,36 @@ class DeconvolutionParameters:
 
 
 @dataclass
+class BaselineParameters:
+    """
+    Parameters for the simple linear heat-flow baseline.
+
+    The baseline is the straight line through two anchor points on the measured
+    curve. Subtracting it removes the slowly decaying background so that the
+    hydration peaks can be integrated individually.
+
+    Attributes
+    ----------
+    anchor_start_s: float
+        Time of the first anchor point in seconds. If None (the default), the
+        heat-flow minimum of the dormant period is used, i.e. the minimum
+        preceding the main peak.
+    anchor_end_s: float
+        Time of the second anchor point in seconds. If None (the default), the
+        last point of the curve is used.
+    window_s: float
+        Width of the averaging window centred on each anchor point in seconds.
+        The heat flow at an anchor is taken as the mean over this window, which
+        suppresses noise. Set to 0 to use the single nearest data point. The
+        default is 3600 s.
+    """
+
+    anchor_start_s: float | None = None
+    anchor_end_s: float | None = None
+    window_s: float = 3600.0
+
+
+@dataclass
 class PlottingParameters:
     """
     Parameters for plotting data.
@@ -314,6 +344,9 @@ class ProcessingParameters:
     slope_analysis: SlopeAnalysisParameters
         Parameters for slope analysis of the heat flow data. This includes settings which control the identification of the mean slope of the main hydration peak.
 
+    baseline : BaselineParameters
+        Parameters for the simple linear heat-flow baseline, i.e. the position of the two anchor points and the width of the averaging window applied at each of them. The default values are defined in the BaselineParameters class.
+
     plotting: PlottingParameters
         Parameters for plotting data. This includes settings such as figure size.
 
@@ -361,6 +394,7 @@ class ProcessingParameters:
     deconvolution: DeconvolutionParameters = field(
         default_factory=DeconvolutionParameters
     )
+    baseline: BaselineParameters = field(default_factory=BaselineParameters)
     plotting: PlottingParameters = field(default_factory=PlottingParameters)
     sample_param_rules: list[SampleParamRule] = field(default_factory=list)
 

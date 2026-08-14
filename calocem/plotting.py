@@ -1342,6 +1342,98 @@ class SimplePlotter:
         ax.grid(True, alpha=0.3)
         return ax
 
+    def plot_baseline(
+        self,
+        data: pd.DataFrame,
+        baseline: pd.DataFrame,
+        ax: Optional[matplotlib.axes.Axes] = None,
+        age_col: str = "time_s",
+        target_col: str = "normalized_heat_flow_w_g",
+        xunit: str = "h",
+        show_corrected: bool = False,
+        cutoff_time_min: Optional[float] = None,
+    ) -> matplotlib.axes.Axes:
+        """Plot heat flow curves together with their linear baseline.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Full measurement data.
+        baseline : pd.DataFrame
+            Output of get_baseline(), one row per sample.
+        ax : matplotlib.axes.Axes, optional
+            Axes to plot on. A new figure is created when not provided.
+        age_col, target_col : str
+            Time and heat flow columns.
+        xunit : str
+            Time unit for the x-axis: 's', 'min', 'h', or 'd'.
+        show_corrected : bool
+            If True, the baseline-corrected curve is drawn in addition to the
+            measured curve and the baseline.
+        cutoff_time_min : float, optional
+            If given, only data beyond this time in minutes are drawn, matching
+            the range over which the baseline was determined.
+        """
+        unit_conversions = {
+            "s": (1.0, "Time [s]"),
+            "min": (1 / 60, "Time [min]"),
+            "h": (1 / 3600, "Time [h]"),
+            "d": (1 / (24 * 3600), "Time [d]"),
+        }
+        x_factor, x_label = unit_conversions.get(xunit, (1.0, "Time [s]"))
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(10, 6))
+
+        for _, row in baseline.iterrows():
+            sample_data = data[data["sample_short"] == row["sample_short"]]
+            if cutoff_time_min:
+                sample_data = sample_data[sample_data[age_col] >= cutoff_time_min * 60]
+            if sample_data.empty:
+                continue
+
+            x = sample_data[age_col].to_numpy(dtype=float)
+            y = sample_data[target_col].to_numpy(dtype=float)
+            baseline_y = (
+                float(row["baseline_intercept_w_g"])
+                + float(row["baseline_slope_w_g_s"]) * x
+            )
+
+            (line,) = ax.plot(x * x_factor, y, label=row["sample_short"])
+            ax.plot(
+                x * x_factor,
+                baseline_y,
+                linestyle="--",
+                color=line.get_color(),
+                label=f"{row['sample_short']} (baseline)",
+            )
+            ax.plot(
+                [row["anchor_start_s"] * x_factor, row["anchor_end_s"] * x_factor],
+                [row["anchor_start_w_g"], row["anchor_end_w_g"]],
+                marker="o",
+                linestyle="none",
+                color=line.get_color(),
+                markersize=7,
+                zorder=5,
+                label=f"{row['sample_short']} (anchors)",
+            )
+
+            if show_corrected:
+                ax.plot(
+                    x * x_factor,
+                    y - baseline_y,
+                    linestyle=":",
+                    color=line.get_color(),
+                    label=f"{row['sample_short']} (corrected)",
+                )
+
+        ax.axhline(0, color="black", linewidth=0.8, alpha=0.4)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Normalized Heat Flow / [W/g]")
+        ax.legend(fontsize="small")
+        ax.grid(True, alpha=0.3)
+        return ax
+
     def plot_onset_intersections(
         self,
         data: pd.DataFrame,
